@@ -2213,12 +2213,6 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlsplit(self.path).path
         if path in ("/", "/index.html"):
             return self._send(200, PAGE, "text/html; charset=utf-8")
-        if path == "/api/pot":
-            try:
-                r = urllib.request.urlopen("http://127.0.0.1:4416/ping", timeout=5)
-                return self._json({"pot": True, "server": json.loads(r.read().decode())})
-            except Exception as e:  # noqa: BLE001
-                return self._json({"pot": False, "err": str(e)[:100]})
         if path == "/api/ping":
             return self._json({"ok": True, "version": VERSION,
                                "cookies": _COOKIES_COUNT, "ytdlp": HAS_YTDLP})
