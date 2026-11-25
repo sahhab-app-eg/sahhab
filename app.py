@@ -12,12 +12,14 @@
 =============================================================
 """
 
+import http.cookiejar
 import json
 import os
 import re
 import socket
 import ssl
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -27,7 +29,7 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.1.0"
+VERSION = "3.0.0"
 PORT = 8765
 
 # ---------------------------------------------------------------
@@ -37,7 +39,7 @@ MSG = {
     "empty_url": "يا عم انت كده مش لاعب.. حط لينك الاول 😅",
     "bad_url": "ده مش لينك ده كلام فارغ! لينك يبدأ بـ http يا نجم 🔗",
     "no_youtube_id": "مش لاقي رقم الفيديو في اللينك ده.. اتاكد منه كده 🤔",
-    "unsupported": "الموقع ده لسه مش متدعوم عندنا يا برنس 😔 الشغال دلوقتي: يوتيوب + فيدوبا/انافاست + لينكات ملفات مباشرة + تيك توك (على مزاجه)",
+    "unsupported": "الموقع ده واقف قصاد حتى المحرك العام 😔 جرب لينك تاني يا برنس",
     "not_playable": "الفيديو ده مش متاح يا صاحبي. السبب: %s",
     "login_required": "الفيديو ده محتاج تسجيل دخول في يوتيوب.. دي خصوصية زيادة عن اللزوم 🔒",
     "no_formats": "يوتيوب بيلعب بيها النهاردة.. مفيش لينكات تحميل واضحة 😤",
@@ -47,10 +49,24 @@ MSG = {
     "hls_fail": "السيرفر قطع علينا النص.. الملف اللي نزل محفوظ وهتكمل منه لو جربت تاني 🧩",
     "cancelled": "وقفنا التحميل زي ما انت عايز 🛑",
     "size_unknown": "حجم غير معروف",
+    "cookies_loaded": "🍪 الكوكيز اتشالت معانا (%d موقع). المواقع المحتاجة تسجيل دخول بقت جاهزة!",
+    "cookies_bad": "ملف الكوكيز ده مش مظبوط.. المفروض يكون بصيغة Netscape (من إضافة Get cookies.txt) 🍪❌",
+    "cookies_howto": "🍪 من المتصفح: نزّل إضافة 'Get cookies.txt LOCALLY'، سجل دخولك للموقع، صدّر الكوكيز وارفع الملف من زرار الكوكيز فوق",
+    "need_ytdlp": "الموقع ده محتاج محرك yt-dlp ومش متسطب على السيرفر 😔",
+    "ytdlp_login": "الموقع ده محتاج تسجيل دخول أو كوكيز 🔒",
+    "ytdlp_fail": "المحرك العام مقدرش يسحب من اللينك ده 😔\nالسبب: %s",
+    "ytdlp_ready": "📹 %s %s (%s)",
+    "ytdlp_video_only": "🎞️ %s (%s) - فيديو لوحده",
+    "ytdlp_audio": "🎧 صوت بس %s (%s)",
 }
 
 UA_PHONE = ("Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36")
+
+UA_PC = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+         "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+UA_IPHONE = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+             "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
 
 _ssl_ctx = ssl.create_default_context()
 
@@ -74,12 +90,65 @@ class Cancelled(Exception):
 # ---------------------------------------------------------------
 # ادوات عامة
 # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# الكوكيز (Netscape cookies.txt) - للمواقع اللي محتاجة تسجيل دخول
+# ---------------------------------------------------------------
+# الكوكيز (Netscape cookies.txt) - للمواقع اللي محتاجة تسجيل دخول
+# ---------------------------------------------------------------
+_JAR = http.cookiejar.MozillaCookieJar()
+_OPENER = urllib.request.build_opener(
+    urllib.request.HTTPSHandler(context=_ssl_ctx),
+    urllib.request.HTTPCookieProcessor(_JAR))
+_COOKIES_FILE = None
+
+
+def load_cookies_file(path):
+    """تحميل cookies.txt بصيغة Netscape. بيرجع عدد الدومينات."""
+    global _COOKIES_FILE
+    jar = http.cookiejar.MozillaCookieJar()
+    try:
+        jar.load(path, ignore_discard=True, ignore_expires=True)
+    except Exception as e:  # noqa: BLE001
+        raise SahhabError(MSG["cookies_bad"] + " (%s)" % e)
+    domains = set()
+    for c in jar:
+        domains.add(c.domain)
+        _JAR.set_cookie(c)
+    _COOKIES_FILE = path
+    return len(domains)
+
+
+def cookies_for(url):
+    """سلسلة Cookie المناسبة للينك (لو في كوكيز محملة)."""
+    if not _COOKIES_FILE:
+        return ""
+    req = urllib.request.Request(url)
+    _JAR.add_cookie_header(req)
+    return req.get_header("Cookie") or ""
+
+
+_COOKIES_COUNT = 0
+
+
+def save_cookies(content):
+    """حفظ محتوى cookies.txt المرفوع من الواجهة وتحميله في الجر."""
+    global _COOKIES_COUNT
+    if not content or "\t" not in content:
+        raise SahhabError(MSG["cookies_bad"])
+    dest = os.path.join(OUTDIR or tempfile.gettempdir(), "cookies.txt")
+    with open(dest, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    _COOKIES_COUNT = load_cookies_file(dest)
+    return {"ok": True, "domains": _COOKIES_COUNT, "msg": MSG["cookies_loaded"] % _COOKIES_COUNT}
+
+
 def http_get(url, headers=None, timeout=30, data=None, max_bytes=None):
+    """طلب HTTP بسيط مع User-Agent محترم."""
     hdrs = {"User-Agent": UA_PHONE}
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, data=data, headers=hdrs)
-    with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx) as r:
+    with _OPENER.open(req, timeout=timeout) as r:
         if max_bytes:
             return r.read(max_bytes)
         return r.read()
@@ -339,6 +408,62 @@ def youtube_formats(video_id):
     return meta, progressive, adaptive, audio
 
 
+def youtube_search(query, limit=10):
+    """بحث يوتيوب من غير مفتاح: نفس Innertube API بتاع التطبيق."""
+    c = INNERTUBE_CLIENTS["android"]
+    client = {k: v for k, v in c.items() if k != "clientNameId"}
+    client.update({"hl": "ar", "timeZone": "UTC", "utcOffsetMinutes": 0})
+    body = {"query": query, "context": {"client": client}}
+    headers = {
+        "content-type": "application/json",
+        "x-youtube-client-name": c["clientNameId"],
+        "x-youtube-client-version": c["clientVersion"],
+        "origin": "https://www.youtube.com",
+        "user-agent": c["userAgent"],
+    }
+    raw = http_get(
+        "https://www.youtube.com/youtubei/v1/search?prettyPrint=false",
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        timeout=30,
+    )
+    resp = json.loads(raw.decode("utf-8", "replace"))
+    results = []
+
+    def _text(node):
+        if not isinstance(node, dict):
+            return ""
+        if "simpleText" in node:
+            return node.get("simpleText") or ""
+        runs = node.get("runs") or []
+        return "".join(r.get("text", "") for r in runs if isinstance(r, dict))
+
+    def _walk(node):
+        if len(results) >= limit:
+            return
+        if isinstance(node, dict):
+            vr = node.get("videoRenderer") or node.get("compactVideoRenderer")
+            if isinstance(vr, dict) and vr.get("videoId"):
+                thumbs = ((vr.get("thumbnail") or {}).get("thumbnails")) or []
+                results.append({
+                    "id": vr["videoId"],
+                    "title": _text(vr.get("title")),
+                    "channel": _text(vr.get("ownerText") or vr.get("longBylineText")),
+                    "duration": _text(vr.get("lengthText")),
+                    "views": _text(vr.get("viewCountText")),
+                    "thumb": (thumbs[-1].get("url") if thumbs and isinstance(thumbs[-1], dict) else "") or "",
+                })
+                return
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                _walk(v)
+
+    _walk(resp.get("contents"))
+    return results
+
+
 # ---------------------------------------------------------------
 # التحميل: resume + progress + retries + الغاء
 # ---------------------------------------------------------------
@@ -356,6 +481,9 @@ def download_file(url, dest_path, headers=None, retries=3, on_progress=None, can
             hdrs = dict(headers or {})
             if done:
                 hdrs["Range"] = "bytes=%d-" % done
+            ck = cookies_for(url)
+            if ck and not any(k.lower() == "cookie" for k in hdrs):
+                hdrs["Cookie"] = ck
             req = urllib.request.Request(url, headers=hdrs)
             if "user-agent" not in {k.lower() for k in hdrs}:
                 req.add_header("User-Agent", UA_PHONE)
@@ -480,6 +608,14 @@ def hls_download(playlist_url, dest_path, headers=None, retries=3, on_progress=N
     segs = parse_media_playlist(text, playlist_url)
     if not segs:
         raise SahhabError(MSG["hls_no_video"])
+    init_url = None
+    mm = re.search(r'#EXT-X-MAP:URI="([^"]+)"', text)
+    if mm:
+        init_url = urllib.parse.urljoin(playlist_url, mm.group(1))
+    fmp4 = bool(init_url and init_url.lower().split('?')[0].endswith(('.mp4', '.cmfv'))) or \
+        segs[0].lower().split('?')[0].endswith(('.m4s', '.mp4', '.cmfv'))
+    if fmp4 and dest_path.lower().endswith('.ts'):
+        dest_path = dest_path[:-3] + '.mp4'
     sidecar = dest_path + '.seg'
     done = 0
     if os.path.exists(sidecar) and os.path.exists(dest_path):
@@ -494,6 +630,9 @@ def hls_download(playlist_url, dest_path, headers=None, retries=3, on_progress=N
     total = len(segs)
     t0 = time.time()
     with open(dest_path, 'ab') as fh:
+        if done == 0 and init_url:
+            fh.write(http_get(init_url, headers=headers, timeout=60))
+            fh.flush()
         for idx in range(done, total):
             if cancel is not None and cancel.is_set():
                 fh.flush()
@@ -526,6 +665,664 @@ def hls_download(playlist_url, dest_path, headers=None, retries=3, on_progress=N
     if os.path.exists(sidecar):
         os.remove(sidecar)
     return dest_path, os.path.getsize(dest_path)
+
+
+# --- فيميو (vimeo): player config العام زي ما المحرك الاصلي بيعمل ---
+def vimeo_extract(url):
+    m = re.search(r'(?:player\.vimeo\.com/video/|vimeo\.com/(?:[a-z]+/[^/?#]+/)*)(\d+)', url)
+    if not m:
+        raise SahhabError(MSG["bad_url"])
+    vid = m.group(1)
+    headers = {"Referer": "https://vimeo.com/", "User-Agent": UA_PHONE}
+    cfg = json.loads(http_get("https://player.vimeo.com/video/%s/config" % vid,
+                              headers=headers, timeout=30).decode("utf-8", "replace"))
+    title = ((cfg.get("video") or {}).get("title")) or "vimeo_%s" % vid
+    files = ((cfg.get("request") or {}).get("files")) or {}
+    options = []
+    for f in sorted(files.get("progressive") or [],
+                    key=lambda x: int(x.get("width") or 0), reverse=True):
+        if f.get("url"):
+            options.append({"type": "file", "url": f["url"], "ext": "mp4", "headers": headers,
+                            "label": "📹 %s (%s)" % (f.get("quality") or "؟", MSG["size_unknown"])})
+    hls = ((files.get("hls") or {}).get("cdns") or {})
+    for cdn in hls.values():
+        if cdn.get("url"):
+            options.append({"type": "hls", "url": cdn["url"], "ext": "ts", "headers": headers,
+                            "label": "📺 بث HLS (كل الجودات)"})
+            break
+    if not options:
+        raise SahhabError(MSG["ytdlp_login"] if (cfg.get("video") or {}).get("drm") else MSG["no_formats"])
+    return title, options
+
+
+# --- ديلي موشن: نفس وصفة الموقع (oauth client_credentials + GraphQL) ---
+_DM_UA = "dailymotion/240213162706 CFNetwork/1492.0.1 Darwin/23.3.0"
+_DM_BASIC = "Basic MGQyZDgyNjQwOWFmOWU3MmRiNWQ6ODcxNmJmYTVjYmEwMmUwMGJkYTVmYTg1NTliNDIwMzQ3NzIyYWMzYQ=="
+_DM_TOKEN = {"v": None, "exp": 0}
+
+
+def _dm_token():
+    if _DM_TOKEN["v"] and time.time() < _DM_TOKEN["exp"] - 60:
+        return _DM_TOKEN["v"]
+    raw = http_get("https://graphql.api.dailymotion.com/oauth/token",
+                   data=b"traffic_segment=&grant_type=client_credentials",
+                   headers={"Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+                            "User-Agent": _DM_UA, "Authorization": _DM_BASIC}, timeout=30)
+    tok = json.loads(raw.decode("utf-8", "replace"))["access_token"]
+    _DM_TOKEN["v"] = tok
+    _DM_TOKEN["exp"] = time.time() + 3000
+    return tok
+
+
+def dailymotion_extract(url):
+    m = re.search(r'(?:dailymotion\.com/(?:video|embed/video)/|dai\.ly/)([A-Za-z0-9]+)', url)
+    if not m:
+        raise SahhabError(MSG["bad_url"])
+    xid = m.group(1)
+    query = ("query Video($xid: String!) { video(xid: $xid) { "
+             "xid title duration hlsURL } }")
+    body = json.dumps({"operationName": "Video", "query": query,
+                       "variables": {"xid": xid}}).encode("utf-8")
+    raw = http_get("https://graphql.api.dailymotion.com/", data=body,
+                   headers={"User-Agent": _DM_UA, "Authorization": "Bearer " + _dm_token(),
+                            "Content-Type": "application/json",
+                            "X-DM-AppInfo-Version": "7.16.0_240213162706",
+                            "X-DM-AppInfo-Type": "iosapp",
+                            "X-DM-AppInfo-Id": "com.dailymotion.dailymotion"}, timeout=30)
+    v = (json.loads(raw.decode("utf-8", "replace")).get("data") or {}).get("video") or {}
+    title = v.get("title") or "dailymotion_%s" % xid
+    options = []
+    if v.get("hlsURL"):
+        options.append({"type": "hls", "url": v["hlsURL"], "ext": "ts",
+                        "headers": {"User-Agent": _DM_UA},
+                        "label": "📺 بث HLS (كل الجودات)"})
+    if not options:
+        raise SahhabError(MSG["no_formats"])
+    return title, options
+
+
+# --- ميل رو (my.mail.ru): videoapi json زي المحرك الاصلي ---
+def mailru_extract(url):
+    headers = {"User-Agent": UA_PHONE, "Referer": url}
+    html = http_get(url, headers=headers, timeout=30).decode("utf-8", "replace")
+    m = re.search(r'content="[^"]*?(videoapi\.my\.mail\.ru/videos/[^&"]+?)(?:&amp;|&|\")', html)
+    if not m:
+        m2 = re.search(r'my\.mail\.ru/mail/([^/]+)/video/([^/]+)/([^/\.]+)', url)
+        if not m2:
+            raise SahhabError(MSG["hls_no_video"])
+        api = "https://videoapi.my.mail.ru/videos/mail/%s/%s/%s.json" % (m2.group(1), m2.group(2), m2.group(3))
+    else:
+        api = "https://" + m.group(1).replace("&amp;", "")
+        if not api.endswith(".json"):
+            api += ".json"
+    meta = json.loads(http_get(api, headers=headers, timeout=30).decode("utf-8", "replace"))
+    title = ((meta.get("movie") or {}).get("title")) or "mailru"
+    options = []
+    for v in meta.get("videos") or []:
+        if v.get("url") and str(v["url"]).startswith("//"):
+            v["url"] = "https:" + v["url"]
+        if v.get("url"):
+            q = (v.get("key") or "؟").upper()
+            options.append({"type": "file", "url": v["url"], "ext": "mp4", "headers": headers,
+                            "label": "📹 %s" % q})
+    if not options:
+        raise SahhabError(MSG["no_formats"])
+    options.sort(key=lambda o: o["label"], reverse=True)
+    return title, options
+
+
+# --- انستجرام: صفحة الـ embed العامة (من غير كوكيز) + api/v1 زي وصفة الـ zip ---
+_IG_HEADERS = {"x-asbd-id": "198387", "x-ig-app-id": "936619743392459", "x-ig-www-claim": "0"}
+
+
+def _ig_shortcode_to_media_id(sc):
+    alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    n = 0
+    for ch in sc[:11]:
+        n = n * 64 + alpha.index(ch)
+    return n
+
+
+def instagram_extract(url):
+    m = re.search(r'instagram\.com/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)', url)
+    if not m:
+        raise SahhabError(MSG["bad_url"])
+    sc = m.group(1)
+    ua = UA_PHONE
+    # صفحة الـ embed بترجع video_url ليوزر ايفون سفاري بس
+    ua_safari = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                 "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1")
+    headers = {"User-Agent": ua_safari, "Referer": "https://www.instagram.com/p/%s/" % sc}
+    title = "instagram_%s" % sc
+    # العنوان من oEmbed العام (شغال من غير كوكيز)
+    try:
+        oe = json.loads(http_get(
+            "https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/p/%s/" % sc,
+            headers={"User-Agent": ua_safari}, timeout=20).decode("utf-8", "replace"))
+        author = oe.get("author_name") or ""
+        if author:
+            title = "instagram_%s_%s" % (author, sc)
+    except Exception:
+        pass
+    options = []
+    # الطريق الاساسي: صفحة الـ embed العامة — شغالة من غير كوكيز
+    try:
+        html = http_get("https://www.instagram.com/p/%s/embed/captioned/" % sc,
+                        headers={"User-Agent": ua_safari}, timeout=30).decode("utf-8", "replace")
+        vids = []
+        for mm in re.finditer(r'\\"video_url\\":\\"((?:\\.|[^"\\])+)\\"', html):
+            u = mm.group(1).replace('\\\\/', '/').replace('\\u0026', '&').replace('\\/', '/')
+            if u.startswith("http") and ".mp4" in u:
+                vids.append(u)
+        seen = set()
+        for u in vids:
+            if u not in seen:
+                seen.add(u)
+                options.append({"type": "file", "url": u, "ext": "mp4", "headers": headers,
+                                "label": "📹 فيديو انستجرام (%s)" % MSG["size_unknown"]})
+    except Exception:
+        options = []
+    # الطريق الاحتياطي: api/v1/media/info بنفس هيدرز الـ zip (بيحتاج IP سكني)
+    if not options:
+        mid = _ig_shortcode_to_media_id(sc)
+        api_headers = dict(_IG_HEADERS)
+        api_headers["User-Agent"] = ua
+        raw = http_get("https://www.instagram.com/api/v1/media/%d/info/" % mid,
+                       headers=api_headers, timeout=30)
+        meta = json.loads(raw.decode("utf-8", "replace"))
+        item = (meta.get("items") or [None])[0]
+        if not item:
+            raise SahhabError(MSG["no_formats"])
+        cap = (item.get("caption") or {}).get("text") or ""
+        if cap:
+            title = cap[:40]
+        for v in item.get("video_versions") or []:
+            if v.get("url"):
+                options.append({"type": "file", "url": v["url"], "ext": "mp4", "headers": api_headers,
+                                "label": "📹 %dx%d" % (v.get("width") or 0, v.get("height") or 0)})
+        imgs = ((item.get("image_versions2") or {}).get("candidates")) or []
+        if not options and imgs:
+            options.append({"type": "file", "url": imgs[0]["url"], "ext": "jpg", "headers": api_headers,
+                            "label": "🖼️ صورة انستجرام"})
+    if not options:
+        raise SahhabError(MSG["no_formats"])
+    return title, options
+
+
+# --- اودنوكلاسنيكي (ok.ru): صفحة الـ embed العامة بتجيب metadata من غير دخول ---
+def okru_extract(url):
+    m = re.search(r'ok\.ru/(?:video|videoembed|live)/(\d+)', url)
+    if not m:
+        raise SahhabError(MSG["bad_url"])
+    vid = m.group(1)
+    headers = {"User-Agent": UA_PC, "Referer": "https://ok.ru/"}
+    html = http_get("https://ok.ru/videoembed/%s" % vid, headers=headers,
+                    timeout=30).decode("utf-8", "replace")
+    mo = re.search(r'data-options="([^"]+)"', html)
+    if not mo:
+        raise SahhabError(MSG["no_formats"])
+    import html as _h
+    opts = json.loads(_h.unescape(mo.group(1)))
+    meta = (opts.get("flashvars") or {}).get("metadata")
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+    if not isinstance(meta, dict):
+        raise SahhabError(MSG["no_formats"])
+    title = ((meta.get("movie") or {}).get("title")) or "ok_%s" % vid
+    options = []
+    rank = {"quad": 0, "full": 1, "hd": 2, "sd": 3, "low": 4, "lowest": 5, "mobile": 6}
+    for v in meta.get("videos") or []:
+        u = v.get("url") or ""
+        if u.startswith("//"):
+            u = "https:" + u
+        if not u.startswith("http"):
+            continue
+        name = (v.get("name") or "sd").lower()
+        options.append({"type": "file", "url": u, "ext": "mp4", "headers": headers,
+                        "label": "📹 %s" % name.upper(),
+                        "_rank": rank.get(name, 3)})
+    options.sort(key=lambda o: o.pop("_rank"))
+    if not options:
+        raise SahhabError(MSG["no_formats"])
+    return title, options
+
+
+# --- ماتش تي في: playlist JSON العام (القناة المباشرة والايفريم) ---
+def matchtv_extract(url):
+    m = re.search(r'matchtv\.ru/(?:vdl/playlist|on-air|video|iframe/channel)/?(\d+)?', url)
+    ch = None
+    if "on-air" in url:
+        ch = "106"
+    elif m and m.group(1):
+        ch = m.group(1)
+    if not ch:
+        m2 = re.search(r'(\d{2,})', url)
+        if not m2:
+            raise SahhabError(MSG["bad_url"])
+        ch = m2.group(1)
+    headers = {"User-Agent": UA_PC, "Referer": "https://matchtv.ru/"}
+    raw = http_get("https://matchtv.ru/vdl/playlist/%s/1.json" % ch, headers=headers, timeout=30)
+    items = json.loads(raw.decode("utf-8", "replace"))
+    options = []
+    for it in items or []:
+        u = it.get("src") or ""
+        if u.endswith(".m3u8"):
+            options.append({"type": "hls", "url": u, "ext": "ts", "headers": headers,
+                            "label": "📺 بث مباشر (%s)" % (it.get("label") or "Auto")})
+    if not options:
+        raise SahhabError(MSG["no_formats"])
+    return "matchtv_%s" % ch, options
+
+
+# --- بينترست: video_list في جيسون الصفحة العامة ---
+def pinterest_extract(url):
+    m = re.search(r'pinterest\.[a-z.]+/pin/(?:[^/]+-)?(\d+)', url)
+    if not m:
+        raise SahhabError(MSG["bad_url"])
+    headers = {"User-Agent": UA_PC, "Referer": "https://www.pinterest.com/"}
+    html = http_get("https://www.pinterest.com/pin/%s/" % m.group(1),
+                    headers=headers, timeout=30).decode("utf-8", "replace")
+    title = "pinterest_%s" % m.group(1)
+    mt = re.search(r'"title"\s*:\s*"([^"\\]{3,80})"', html)
+    if mt:
+        title = mt.group(1)
+    options = []
+    seen = set()
+    # mp4 الجاهزة (expMp4) مرتبة من احسن جودة
+    mp4s = []
+    for mm in re.finditer(r'https://v1\.pinimg\.com/videos/mc/expMp4/[^"\\ ]+\.mp4', html):
+        u = mm.group(0)
+        if u not in seen:
+            seen.add(u)
+            mp4s.append(u)
+    def _q(u):
+        mq = re.search(r'_(t\d+)\.mp4', u)
+        return int(mq.group(1)[1:]) if mq else 0
+    for u in sorted(mp4s, key=_q):
+        options.append({"type": "file", "url": u, "ext": "mp4", "headers": headers,
+                        "label": "📹 جودة %s" % (_q(u) or "؟")})
+    # ولو مفيش، بث HLS
+    for mm in re.finditer(r'https://v1\.pinimg\.com/videos/[^"\\ ]+\.m3u8', html):
+        u = mm.group(0)
+        if u not in seen:
+            seen.add(u)
+            options.append({"type": "hls", "url": u, "ext": "ts", "headers": headers,
+                            "label": "📺 بث HLS"})
+    if not options:
+        raise SahhabError(MSG["no_formats"])
+    return title, options
+
+
+_VK_TOKEN = {"v": None, "exp": 0}
+
+def vk_anonym_token():
+    """توكن زائر مجاني من VK نفسها (زي ما الموقع بيعمل بالظبط)."""
+    import time as _t
+    if _VK_TOKEN["v"] and _t.time() < _VK_TOKEN["exp"] - 300:
+        return _VK_TOKEN["v"]
+    data = urllib.parse.urlencode({
+        "client_secret": "QbYic1K3lEV5kTGiqlq2", "client_id": "6287487",
+        "scopes": "audio_anonymous,video_anonymous,photos_anonymous,profile_anonymous",
+        "isApiOauthAnonymEnabled": "false", "version": "1", "app_id": "52461373"}).encode()
+    raw = http_get("https://login.vk.ru/?act=get_anonym_token", data=data,
+                   headers={"User-Agent": UA_PC, "Content-Type": "application/x-www-form-urlencoded",
+                            "Referer": "https://vkvideo.ru/", "Origin": "https://vkvideo.ru"},
+                   timeout=30)
+    j = json.loads(raw.decode("utf-8", "replace"))
+    tok = ((j.get("data") or {}).get("access_token")) or ""
+    if not tok:
+        raise SahhabError(MSG["no_formats"])
+    _VK_TOKEN["v"] = tok
+    _VK_TOKEN["exp"] = _t.time() + 3600
+    return tok
+
+
+def vk_extract(url):
+    """VK / VK Video: API الزوائر العمومي، من غير لوجين."""
+    m = re.search(r'(?:video|clip)(-?\d+)_(\d+)', url)
+    if not m:
+        m2 = re.search(r'video_ext\.php\?[^#]*oid=(-?\d+)[^#]*id=(\d+)', url)
+        m = m2
+    if not m:
+        raise SahhabError(MSG["bad_url"])
+    oid, vid = m.group(1), m.group(2)
+    headers = {"User-Agent": UA_PC, "Referer": "https://vkvideo.ru/", "Origin": "https://vkvideo.ru"}
+    tok = vk_anonym_token()
+    api = ("https://api.vk.ru/method/video.getEmbed?v=5.289&client_id=52461373"
+           "&owner_id=%s&video_id=%s" % (oid, vid))
+    raw = http_get(api, headers=dict(headers, Authorization="Bearer " + tok), timeout=30)
+    j = json.loads(raw.decode("utf-8", "replace"))
+    if j.get("error"):
+        raise SahhabError(MSG["no_formats"] + " (%s)" % (j["error"].get("error_msg", ""))[:60])
+    v = (j.get("response") or {}).get("video") or {}
+    files = v.get("files") or {}
+    options = []
+    dl_headers = {"User-Agent": UA_PC, "Referer": "https://vkvideo.ru/"}
+    for q in ("720", "480", "360", "240", "144"):
+        if files.get("mp4_" + q):
+            options.append({"type": "file", "url": files["mp4_" + q], "ext": "mp4",
+                            "headers": dl_headers, "label": "📹 MP4 %sp" % q})
+    if files.get("hls"):
+        options.append({"type": "hls", "url": files["hls"], "ext": "ts", "headers": dl_headers,
+                        "label": "📺 بث HLS (كل الجودات)"})
+    if not options:
+        raise SahhabError(MSG["no_formats"])
+    return v.get("title") or "vk_%s_%s" % (oid, vid), options
+
+
+def facebook_extract(url):
+    """فيسبوك: صفحة المشاركة + صفحة البلجن العمومية، بدون لوجين"""
+    headers_pc = {"User-Agent": UA_PC, "Referer": "https://www.facebook.com/"}
+    vid = None
+    og_video = None
+    m = re.search(r'(?:watch/?\?.*v=|/reel/|/videos/|video\.php\?.*v=)(\d{8,})', url)
+    if m:
+        vid = m.group(1)
+    if not vid:
+        # لينكات share: الصفحة نفسها بتقول الفيديو الحقيقي (بمتصفح موبايل)
+        html = http_get(url, headers={"User-Agent": UA_IPHONE}, timeout=30).decode("utf-8", "replace")
+        m2 = re.search(r'(?:canonical" href="|og:url" content=")[^"]*?(?:/reel/|/videos/|v=)(\d{8,})', html)
+        if m2:
+            vid = m2.group(1)
+        mo = re.search(r'og:video" content="([^"]+)"', html)
+        if mo:
+            og_video = mo.group(1).replace("&amp;", "&")
+    if not vid and not og_video:
+        raise SahhabError(MSG["no_formats"])
+    options = []
+    if vid:
+        # صفحة البلجن العمومية بتدي mp4 جاهزة HD و SD
+        try:
+            html = http_get("https://www.facebook.com/plugins/video.php?href=" +
+                            urllib.parse.quote("https://www.facebook.com/watch/?v=" + vid, safe="") + "&show_text=0",
+                            headers=headers_pc, timeout=30).decode("utf-8", "replace")
+            for kind, lab in (("hd_src", "HD 720p"), ("sd_src", "SD")):
+                mm = re.search(r'"%s"\s*:\s*"([^"]+)"' % kind, html)
+                if mm:
+                    u = (mm.group(1).replace("\\u0025", "%").replace("\\/", "/")
+                         .replace("\\u0026", "&").replace("&amp;", "&"))
+                    options.append({"type": "file", "url": u, "ext": "mp4", "headers": headers_pc,
+                                    "label": "📹 " + lab})
+        except Exception:
+            pass
+    if og_video:
+        options.append({"type": "file", "url": og_video, "ext": "mp4", "headers": headers_pc,
+                        "label": "📹 SD"})
+    if not options:
+        raise SahhabError(MSG["no_formats"])
+    return "facebook_" + (vid or "video"), options
+
+
+# --- ساوند كلاود: client_id من سكربتات الموقع + transcodings زي المحرك ---
+_SC_CID = {"v": None}
+
+
+def _sc_cid_from_js(body):
+    m = re.search(r'client_id:a\?"([A-Za-z0-9]{32})"', body)
+    if not m:
+        m = re.search(r'client_id\s*[:=]\s*"([A-Za-z0-9]{32})"', body)
+    return m.group(1) if m else None
+
+
+def _sc_client_id():
+    if _SC_CID["v"]:
+        return _SC_CID["v"]
+    headers = {"User-Agent": UA_PC}
+    # الطريق 1: سكربتات الموقع الرئيسي
+    try:
+        html = http_get("https://soundcloud.com", headers=headers,
+                        timeout=30).decode("utf-8", "replace")
+        scripts = re.findall(r'src="(https://(?:a-v2|a|m)\.sndcdn\.com/[^"]+\.js)"', html)
+        for js in reversed(scripts[-8:]):
+            try:
+                cid = _sc_cid_from_js(http_get(js, headers=headers, timeout=30).decode("utf-8", "replace"))
+            except Exception:  # noqa: BLE001
+                continue
+            if cid:
+                _SC_CID["v"] = cid
+                return cid
+    except Exception:  # noqa: BLE001
+        pass
+    # الطريق 2: سكربتات الويدجت العامة (w.soundcloud.com)
+    w = http_get("https://w.soundcloud.com/player/?url=https%3A//api.soundcloud.com/tracks/293",
+                 headers=headers, timeout=30).decode("utf-8", "replace")
+    for js in re.findall(r'src="(https://widget\.sndcdn\.com/[^"]+\.js)"', w):
+        try:
+            cid = _sc_cid_from_js(http_get(js, headers=headers, timeout=30).decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001
+            continue
+        if cid:
+            _SC_CID["v"] = cid
+            return cid
+    raise SahhabError(MSG["fail_final"])
+
+
+def soundcloud_extract(url):
+    cid = _sc_client_id()
+    raw = http_get("https://api-v2.soundcloud.com/resolve?url=%s&client_id=%s"
+                   % (urllib.parse.quote(url, safe=""), cid),
+                   headers={"User-Agent": UA_PHONE}, timeout=30)
+    track = json.loads(raw.decode("utf-8", "replace"))
+    if track.get("kind") == "playlist":
+        raise SahhabError(MSG["unsupported"])
+    title = track.get("title") or "soundcloud"
+    auth = track.get("track_authorization") or ""
+    options = []
+    seen_tc = set()
+    for tr in (track.get("media") or {}).get("transcodings") or []:
+        proto = (tr.get("format") or {}).get("protocol") or ""
+        u = "%s?client_id=%s" % (tr.get("url"), cid)
+        if auth:
+            u += "&track_authorization=" + auth
+        try:
+            final = json.loads(http_get(u, headers={"User-Agent": UA_PHONE},
+                                        timeout=30).decode("utf-8", "replace"))["url"]
+        except Exception:  # noqa: BLE001
+            continue
+        mime = (tr.get("format") or {}).get("mime_type") or ""
+        key = (proto, mime)
+        if key in seen_tc:
+            continue
+        seen_tc.add(key)
+        if proto == "progressive":
+            options.append({"type": "file", "url": final, "ext": "mp3",
+                            "label": "🎧 mp3 (افضل صوت جاهز)"})
+        elif proto == "hls" and "mpegurl" in mime:
+            options.insert(0, {"type": "hls", "url": final, "ext": "mp3",
+                               "label": "🎧 mp3 (بث)"})
+        elif proto == "hls" and "mp4" in mime:
+            options.append({"type": "hls", "url": final, "ext": "m4a",
+                            "label": "🎧 aac 160k (بث)"})
+    if not options:
+        raise SahhabError(MSG["ytdlp_login"])
+    return title, options
+
+
+# ---------------------------------------------------------------
+# المحرك العام (yt-dlp) - لاي موقع تاني: بيشتغل لو yt-dlp متسطب
+# ---------------------------------------------------------------
+try:
+    import yt_dlp  # type: ignore
+    HAS_YTDLP = True
+except ImportError:
+    HAS_YTDLP = False
+
+
+def ytdlp_extract(url):
+    """بيرجع (title, options). كل option: {type: file|hls, url, ext, label, headers}."""
+    if not HAS_YTDLP:
+        raise SahhabError(MSG["need_ytdlp"])
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+            "noplaylist": True, "socket_timeout": 30,
+            "http_headers": {"User-Agent": UA_PHONE}}
+    if _COOKIES_FILE:
+        opts["cookiefile"] = _COOKIES_FILE
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:  # noqa: BLE001
+        low = str(e).lower()
+        if "unsupported url" in low:
+            raise SahhabError(MSG["unsupported"])
+        if any(k in low for k in ("login", "sign in", "cookies", "private", "403")):
+            raise SahhabError(MSG["ytdlp_login"] + "\n" + MSG["cookies_howto"])
+        raise SahhabError(MSG["ytdlp_fail"] % str(e).split('\n')[0][:120])
+    if not info:
+        raise SahhabError(MSG["unsupported"])
+    if info.get("_type") == "playlist" and info.get("entries"):
+        info = next((x for x in info["entries"] if x), None) or {}
+    title = info.get("title") or "video"
+    headers = dict(info.get("http_headers") or {})
+    fmts = info.get("formats") or []
+    options = []
+
+    def ftype(f):
+        return "hls" if "m3u8" in (f.get("protocol") or "") else "file"
+
+    def fsize(f):
+        n = f.get("filesize") or f.get("filesize_approx")
+        return human_size(int(n)) if n else MSG["size_unknown"]
+
+    def res(f):
+        if f.get("height"):
+            return "%dp" % f["height"]
+        return f.get("format_note") or f.get("resolution") or "؟"
+
+    progressive = [f for f in fmts if f.get("url")
+                   and f.get("vcodec") not in (None, "none")
+                   and f.get("acodec") not in (None, "none")]
+    progressive.sort(key=lambda f: (int(f.get("height") or 0), float(f.get("tbr") or 0)), reverse=True)
+    for f in progressive[:6]:
+        options.append({"type": ftype(f), "url": f["url"], "ext": f.get("ext") or "mp4",
+                        "headers": headers,
+                        "label": MSG["ytdlp_ready"] % (res(f), f.get("ext") or "", fsize(f))})
+    if not progressive and info.get("url"):
+        options.append({"type": ftype(info), "url": info["url"],
+                        "ext": info.get("ext") or "mp4", "headers": headers,
+                        "label": MSG["ytdlp_ready"] % (res(info), info.get("ext") or "", fsize(info))})
+    vids = [f for f in fmts if f.get("url") and f.get("vcodec") not in (None, "none")
+            and f.get("acodec") in (None, "none")]
+    vids.sort(key=lambda f: int(f.get("height") or 0), reverse=True)
+    for f in vids[:2]:
+        options.append({"type": ftype(f), "url": f["url"], "ext": f.get("ext") or "mp4",
+                        "headers": headers, "advanced": True,
+                        "label": MSG["ytdlp_video_only"] % (res(f), fsize(f))})
+    auds = [f for f in fmts if f.get("url") and f.get("acodec") not in (None, "none")
+            and f.get("vcodec") in (None, "none")]
+    auds.sort(key=lambda f: float(f.get("abr") or 0), reverse=True)
+    if auds:
+        f = auds[0]
+        options.append({"type": ftype(f), "url": f["url"], "ext": f.get("ext") or "m4a",
+                        "headers": headers,
+                        "label": MSG["ytdlp_audio"] % (f.get("ext") or "", fsize(f))})
+    if not options:
+        raise SahhabError(MSG["unsupported"])
+    return title, options
+
+
+# ---------------------------------------------------------------
+# ترجمات يوتيوب (SRT / VTT / TXT)
+# ---------------------------------------------------------------
+def youtube_caption_tracks(video_id):
+    """نجيب لستة الترجمات من رد البلاير (نفس Innertube بتاع الفيديو)."""
+    visitor = get_visitor_data(video_id)
+    for ck in ("visionos", "android", "ios"):
+        try:
+            resp = innertube_player(video_id, ck, visitor)
+        except Exception:  # noqa: BLE001
+            continue
+        if (resp.get("playabilityStatus") or {}).get("status") not in ("OK", None):
+            continue
+        tracks = (((resp.get("captions") or {}).get("playerCaptionsTracklistRenderer") or {})
+                  .get("captionTracks")) or []
+        out = []
+        for t in tracks:
+            if not t.get("baseUrl"):
+                continue
+            name = ((t.get("name") or {}).get("simpleText")
+                    or "".join(r.get("text", "") for r in (t.get("name") or {}).get("runs", [])))
+            out.append({"lang": t.get("languageCode", "?"),
+                        "name": name or t.get("languageCode", "?"),
+                        "auto": t.get("kind") == "asr",
+                        "base": t["baseUrl"]})
+        if out:
+            return out
+    return []
+
+
+def vtt_to_srt(vtt):
+    """تحويل VTT لـ SRT بسيط."""
+    lines = []
+    body = re.sub(r"^WEBVTT[^\n]*\n", "", vtt.lstrip("\ufeff"))
+    n = 0
+    for block in re.split(r"\n\s*\n", body):
+        block = block.strip()
+        if not block or block.startswith("NOTE"):
+            continue
+        rows = block.splitlines()
+        ti = next((i for i, r in enumerate(rows) if "-->" in r), None)
+        if ti is None:
+            continue
+        n += 1
+        ts = rows[ti]
+        ts = re.sub(r"(\d{2}:\d{2}:\d{2})\.(\d{3})", r"\1,\2", ts)
+        ts = re.sub(r"\s+[^ ]*$", "", ts) if ts.count(" ") > 2 else ts
+        text = "\n".join(re.sub(r"<[^>]+>", "", r) for r in rows[ti + 1:]).strip()
+        if text:
+            lines.append("%d\n%s\n%s" % (n, ts, text))
+    return "\n\n".join(lines) + "\n"
+
+
+def vtt_to_txt(vtt):
+    """نص الترجمة بس من غير توقيت ولا تكرار."""
+    seen = set()
+    out = []
+    for line in vtt.splitlines():
+        if "-->" in line or not line.strip() or line.startswith(("WEBVTT", "NOTE", "Kind:", "Language:")):
+            continue
+        t = re.sub(r"<[^>]+>", "", line).strip()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return "\n".join(out) + "\n"
+
+
+def download_caption(track, fmt, dest):
+    url = track["base"]
+    if fmt == "vtt":
+        url += ("&" if "?" in url else "?") + "fmt=vtt"
+    raw = http_get(url, headers={"User-Agent": UA_PC}, timeout=30).decode("utf-8", "replace")
+    if "WEBVTT" not in raw[:200]:
+        # يوتيوب بيرجع XML قديم لو fmt مش متاحة
+        raw = xml_captions_to_vtt(raw)
+    if fmt == "srt":
+        text = vtt_to_srt(raw)
+    elif fmt == "txt":
+        text = vtt_to_txt(raw)
+    else:
+        text = raw
+    if not text.strip():
+        raise SahhabError(MSG["no_formats"])
+    with open(dest, "w", encoding="utf-8") as f:
+        f.write(text)
+    return dest, len(text)
+
+
+def xml_captions_to_vtt(xml):
+    out = ["WEBVTT", ""]
+    for m in re.finditer(r'<text start="([\d.]+)"(?:\s+dur="([\d.]+)")?[^>]*>(.*?)</text>', xml, re.S):
+        start = float(m.group(1))
+        dur = float(m.group(2) or 2)
+        def ts(x):
+            h = int(x // 3600); mnt = int((x % 3600) // 60); s = x % 60
+            return "%02d:%02d:%06.3f" % (h, mnt, s)
+        body = (m.group(3).replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+                .replace("&#39;", "'").replace("&quot;", '"').replace("\n", " "))
+        body = re.sub(r"<[^>]+>", "", body).strip()
+        if body:
+            out.append("%s --> %s\n%s" % (ts(start), ts(start + dur), body))
+            out.append("")
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------
@@ -575,10 +1372,33 @@ def normalize_url(raw):
 def route(url):
     host = urllib.parse.urlsplit(url).netloc.lower()
     host = host.split("@")[-1].split(":")[0]
+    # اصلاح غلطة الموقع الاصلي: كان بيعمل substring match على "youtube"
     if re.search(r"(^|\.)(youtube\.com|youtu\.be|youtube-nocookie\.com)$", host):
         return "youtube"
     if re.search(r"(^|\.)(vidoba\.org|anafast\.org)$", host):
         return "vidoba"
+    if re.search(r"(^|\.)(vimeo\.com|player\.vimeo\.com)$", host):
+        return "vimeo"
+    if re.search(r"(^|\.)(dailymotion\.com|dai\.ly)$", host):
+        return "dailymotion"
+    if re.search(r"(^|\.)my\.mail\.ru$", host):
+        return "mailru"
+    if re.search(r"(^|\.)soundcloud\.com$", host):
+        return "soundcloud"
+    if re.search(r"(^|\.)instagram\.com$", host):
+        return "instagram"
+    if re.search(r"(^|\.)(ok\.ru|odnoklassniki\.ru)$", host):
+        return "okru"
+    if re.search(r"(^|\.)matchtv\.ru$", host):
+        return "matchtv"
+    if re.search(r"(^|\.)pinterest\.[a-z.]+$", host):
+        return "pinterest"
+    if re.search(r"(^|\.)(facebook\.com|fb\.watch)$", host):
+        return "facebook"
+    if re.search(r"(^|\.)(vk\.com|vkvideo\.ru|vk\.me|m\.vk\.com)$", host):
+        return "vk"
+    if re.search(r"(^|\.)reddit\.com$", host):
+        return "reddit"
     if re.search(r"(^|\.)tiktok\.com$", host):
         return "tiktok"
     if re.search(r"\.(mp4|webm|mkv|mp3|m4a|mov|avi)([?#].*)?$", url, re.I):
@@ -598,12 +1418,43 @@ def _csize(f):
     return int(s) if s.isdigit() else None
 
 
+GENERIC = {
+    "vimeo": vimeo_extract, "dailymotion": dailymotion_extract,
+    "mailru": mailru_extract, "soundcloud": soundcloud_extract,
+    "instagram": instagram_extract, "okru": okru_extract,
+    "matchtv": matchtv_extract, "pinterest": pinterest_extract,
+    "facebook": facebook_extract, "vk": vk_extract,
+}
+
+
+def _eng_label(label):
+    """نفصل الايموجي الاول والتفاصيل بين قوسين من ليبل المحرك."""
+    lab = re.sub(r"^\S+\s+", "", label or "").strip()
+    note = ""
+    m = re.match(r"^(.*?)\s*\((.*?)\)\s*$", lab)
+    if m:
+        lab, note = m.group(1).strip(), m.group(2).strip()
+    return lab or "تحميل", note
+
+
+def _eng_options(eng_options):
+    """تحويل اختيارات محركات v3 لشكل الموقع الداخلي."""
+    out = []
+    for o in eng_options:
+        ext = (o.get("ext") or "mp4").lower()
+        lab, note = _eng_label(o.get("label", ""))
+        audio = ext in ("mp3", "m4a", "aac", "wav", "ogg", "opus")
+        group = "audio" if audio else ("video" if o.get("advanced") else "ready")
+        out.append(dict(group=group, quality=lab, ext=ext, size=None,
+                        type=o.get("type") or "file", url=o["url"],
+                        headers=o.get("headers") or {}, note=note))
+    return out
+
+
 def analyze(url):
     """بيرجع (public_info, internal_info). بيرمي SahhabError لو فشل."""
     kind = route(url)
-    if kind == "unknown":
-        raise SahhabError(MSG["unsupported"])
-    options = []   # internal: dict(label, group, quality, ext, size, type, url, headers)
+    options = []   # internal: dict(group, quality, ext, size, type, url, headers)
     meta = {"title": "", "author": "", "duration": "", "thumb": "", "source": kind}
 
     if kind == "youtube":
@@ -625,6 +1476,16 @@ def analyze(url):
             f = audio[0]
             options.append(dict(group="audio", quality="m4a", ext="m4a",
                                 size=_csize(f), type="file", url=f["url"], headers={}))
+        try:
+            tracks = youtube_caption_tracks(vid)
+        except Exception:  # noqa: BLE001
+            tracks = []
+        for t in tracks:
+            nm = t["name"] + (" (اوتوماتيك)" if t["auto"] else "")
+            for fmt in ("srt", "vtt", "txt"):
+                options.append(dict(group="subs", quality=nm, ext=fmt, size=None,
+                                    type="subs", url="", headers={},
+                                    track=t, lang=t["lang"]))
 
     elif kind == "vidoba":
         host = urllib.parse.urlsplit(url).netloc.lower()
@@ -671,6 +1532,27 @@ def analyze(url):
         options.append(dict(group="audio" if audio_ext else "ready", quality=ext.upper(), ext=ext,
                             size=size, type="file", url=url, headers={}))
 
+    else:
+        # محرك مخصص للموقع، ولو تعثر نكمل بالمحرك العام (yt-dlp)
+        eng = GENERIC.get(kind)
+        title, eng_options, err = None, None, None
+        if eng:
+            try:
+                title, eng_options = eng(url)
+            except Exception as e:  # noqa: BLE001
+                err = e
+        if eng_options is None:
+            if HAS_YTDLP:
+                title, eng_options = ytdlp_extract(url)
+            elif isinstance(err, SahhabError):
+                raise err
+            elif err is not None:
+                raise SahhabError(MSG["fail_final"] + " (%s)" % err)
+            else:
+                raise SahhabError(MSG["unsupported"])
+        meta["title"] = title or ""
+        options = _eng_options(eng_options)
+
     if not options:
         raise SahhabError(MSG["no_formats"])
 
@@ -708,13 +1590,19 @@ def _run_job(job, opt, title):
         job["pct"] = round(done * 100.0 / total, 1) if total else 0
 
     try:
-        fname = sanitize_filename("%s [%s]" % (title, opt["quality"]) if opt["type"] == "hls" else title,
-                                  opt["ext"])
+        if opt["type"] == "subs":
+            fname = sanitize_filename("%s.%s" % (title, opt.get("lang") or "subs"), opt["ext"])
+        else:
+            fname = sanitize_filename("%s [%s]" % (title, opt["quality"]) if opt["type"] == "hls" else title,
+                                      opt["ext"])
         dest = unique_path(os.path.join(OUTDIR, fname))
         job["file"] = os.path.basename(dest)
         job["path"] = dest
         job["state"] = "running"
-        if opt["type"] == "hls":
+        if opt["type"] == "subs":
+            job["pct"] = 10
+            path, size = download_caption(opt["track"], opt["ext"], dest)
+        elif opt["type"] == "hls":
             path, size = hls_download(opt["url"], dest, headers=opt["headers"], on_progress=prog, cancel=cancel)
         elif opt["type"] == "tiktok":
             err = None
@@ -877,6 +1765,23 @@ h1{font-size:clamp(2.5rem,8.5vw,5.4rem);font-weight:900;line-height:1.12;letter-
 .err.show{display:block;animation:pop .35s cubic-bezier(.2,.9,.3,1.3)}
 @keyframes pop{from{opacity:0;transform:translateY(10px) scale(.97)}to{opacity:1;transform:none}}
 
+.ckrow{margin-top:16px;display:flex;gap:10px;justify-content:center;align-items:center}
+.ckbtn{background:rgba(255,255,255,.06);border:1px solid var(--line);color:var(--mut);font:inherit;font-weight:700;font-size:.85rem;padding:7px 18px;border-radius:99px;cursor:pointer;transition:.2s}
+.ckbtn:hover{color:var(--ink);background:rgba(255,255,255,.13)}
+.ckstate{font-size:.83rem;color:var(--ok);font-weight:700}
+
+.sres{display:none;max-width:760px;margin:18px auto 0}
+.sres.show{display:block;animation:pop .35s}
+.sres .gt{margin-bottom:10px;font-weight:800}
+.sres .gt small{font-weight:400;color:var(--mut);font-size:.82rem;margin-right:8px}
+.sitem{display:flex;gap:12px;align-items:center;width:100%;padding:10px;border-radius:16px;background:rgba(255,255,255,.05);border:1px solid var(--line);cursor:pointer;margin-bottom:8px;text-align:right;font:inherit;color:inherit;transition:.2s}
+.sitem:hover{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.25)}
+.sitem img{width:96px;aspect-ratio:16/9;object-fit:cover;border-radius:10px;flex:none;background:#0e1126}
+.nothumb{width:96px;flex:none;text-align:center;font-size:1.6rem}
+.sitem .si{display:flex;flex-direction:column;min-width:0}
+.sitem .si b{font-size:.95rem;line-height:1.4;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.sitem .si small{color:var(--mut);font-size:.8rem}
+
 /* ===== ماركي المواقع ===== */
 .marq{margin:54px 0 0;overflow:hidden;-webkit-mask-image:linear-gradient(90deg,transparent,#000 15%,#000 85%,transparent);mask-image:linear-gradient(90deg,transparent,#000 15%,#000 85%,transparent)}
 .mt{display:flex;gap:14px;width:max-content;animation:mq 30s linear infinite}
@@ -1028,22 +1933,25 @@ footer .mark{width:32px;height:32px;border-radius:10px}.footer .mark svg{width:1
 
 <main class="wrap" id="top">
   <section class="hero">
-    <div class="badge rv"><b>جديد</b><span class="dot"></span> النسخة الجديدة شغالة دلوقتي</div>
+    <div class="badge rv"><b>v3</b><span class="dot"></span> محرك جديد: مواقع أكتر + ترجمات + كوكيز 🚀</div>
     <h1 class="rv">حمّل أي فيديو<br><span class="grad">في ثواني معدودة</span></h1>
     <p class="sub rv">الصق اللينك، اختار الجودة، وخلاص. من غير تسجيل ومن غير إعلانات ومن غير وجع دماغ.</p>
 
     <div class="bar-wrap rv"><div class="bar">
       <span class="ic">🔗</span>
-      <input id="url" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="الصق لينك الفيديو هنا..." />
+      <input id="url" type="text" inputmode="text" autocomplete="off" spellcheck="false" placeholder="الصق لينك أو اكتب اسم الفيديو..." />
       <button class="paste" id="paste" type="button">📋 لصق</button>
       <button class="go" id="go" type="button">حلّل ✨</button>
     </div></div>
-    <div class="hint rv"><span>مجاني بالكامل</span><span>بيكمل لو النت قطع</span><span>بيشتغل على جهازك</span></div>
+    <div class="hint rv"><span>مجاني بالكامل</span><span>بيكمل لو النت قطع</span><span>🌍 مئات المواقع</span></div>
+    <div class="ckrow rv"><button class="ckbtn" id="ckBtn" type="button">🍪 رفع كوكيز</button><span class="ckstate" id="ckState"></span></div>
+    <input type="file" id="ckFile" accept=".txt,text/plain" hidden>
     <div class="err" id="err"></div>
+    <div class="sres" id="sres"></div>
 
     <div class="marq rv"><div class="mt">
-      <div class="src"><i>▶️</i>يوتيوب</div><div class="src"><i>🎵</i>تيك توك</div><div class="src"><i>📺</i>فيدوبا</div><div class="src"><i>⚡</i>انافاست</div><div class="src"><i>📁</i>لينكات مباشرة</div><div class="src"><i>🎧</i>صوت m4a</div><div class="src"><i>🎞️</i>MP4 / WEBM</div><div class="src"><i>📡</i>بث HLS</div>
-      <div class="src"><i>▶️</i>يوتيوب</div><div class="src"><i>🎵</i>تيك توك</div><div class="src"><i>📺</i>فيدوبا</div><div class="src"><i>⚡</i>انافاست</div><div class="src"><i>📁</i>لينكات مباشرة</div><div class="src"><i>🎧</i>صوت m4a</div><div class="src"><i>🎞️</i>MP4 / WEBM</div><div class="src"><i>📡</i>بث HLS</div>
+      <div class="src"><i>▶️</i>يوتيوب</div><div class="src"><i>🎵</i>تيك توك</div><div class="src"><i>🎬</i>فيميو</div><div class="src"><i>📺</i>ديلي موشن</div><div class="src"><i>📸</i>انستجرام</div><div class="src"><i>👍</i>فيسبوك</div><div class="src"><i>🎧</i>ساوند كلاود</div><div class="src"><i>📌</i>بينترست</div><div class="src"><i>⚡</i>فيدوبا</div><div class="src"><i>📁</i>لينكات مباشرة</div><div class="src"><i>🌍</i>ومئات غيرهم</div>
+      <div class="src"><i>▶️</i>يوتيوب</div><div class="src"><i>🎵</i>تيك توك</div><div class="src"><i>🎬</i>فيميو</div><div class="src"><i>📺</i>ديلي موشن</div><div class="src"><i>📸</i>انستجرام</div><div class="src"><i>👍</i>فيسبوك</div><div class="src"><i>🎧</i>ساوند كلاود</div><div class="src"><i>📌</i>بينترست</div><div class="src"><i>⚡</i>فيدوبا</div><div class="src"><i>📁</i>لينكات مباشرة</div><div class="src"><i>🌍</i>ومئات غيرهم</div>
     </div></div>
   </section>
 
@@ -1084,7 +1992,7 @@ footer .mark{width:32px;height:32px;border-radius:10px}.footer .mark svg{width:1
       <div class="card c-b rv"><div class="ico">🔁</div><h3>استكمال ذكي</h3><p>النت فصل؟ ولا يهمك، بيكمل من نفس النقطة بدل ما يبدأ من الأول.</p></div>
       <div class="card c-c rv"><div class="big">0 ج</div><p>مجاني بالكامل، ومفيش اشتراكات.</p></div>
       <div class="card c-d rv"><div class="ico">🎧</div><h3>فيديو أو صوت</h3><p>اسحب الفيديو كامل أو الصوت بس.</p></div>
-      <div class="card c-e rv"><div class="ico">🔒</div><h3>خصوصية تامة</h3><p>بيشتغل على جهازك. مفيش حساب ولا تتبع.</p></div>
+      <div class="card c-e rv"><div class="ico">🔒</div><h3>خصوصية تامة</h3><p>مفيش حساب ولا تتبع. الكوكيز اللي بترفعها بتفضل على السيرفر مؤقتا وبتتمسح.</p></div>
     </div>
   </section>
 
@@ -1093,7 +2001,8 @@ footer .mark{width:32px;height:32px;border-radius:10px}.footer .mark svg{width:1
     <div class="faq">
       <details class="rv"><summary>الملفات بتتحفظ فين؟</summary><p>في مجلد Sahhab جوه مجلد التحميلات في موبايلك لو متاح، وتقدر كمان تضغط «حفظ» عشان المتصفح ينزلها.</p></details>
       <details class="rv"><summary>ليه بعض الجودات العالية من غير صوت؟</summary><p>يوتيوب بيفصل الصوت عن الفيديو في الجودات العالية. لو عايزهم مع بعض اختار من «جاهز للتشغيل».</p></details>
-      <details class="rv"><summary>الموقع مش مدعوم، أعمل إيه؟</summary><p>الشغال حاليا: يوتيوب، تيك توك، فيدوبا، انافاست، وأي لينك مباشر لملف فيديو أو صوت.</p></details>
+      <details class="rv"><summary>إيه المواقع الشغالة؟</summary><p>يوتيوب (بجوداته وترجماته)، تيك توك، فيميو، ديلي موشن، انستجرام، فيسبوك، ساوند كلاود، بينترست، VK، فيدوبا وانافاست، وأي لينك مباشر. وأي موقع تاني بنجرب عليه المحرك العام اللي بيعرف مئات المواقع 🌍</p></details>
+      <details class="rv"><summary>إيه زرار 🍪 كوكيز؟</summary><p>بعض المواقع بترفض تدي الفيديو من غير تسجيل دخول. نزّل إضافة «Get cookies.txt LOCALLY» على المتصفح، سجل دخولك للموقع، صدّر الكوكيز وارفع الملف من الزرار ده. الملف بيتخزن على السيرفر مؤقتا وبيتمسح مع إعادة التشغيل.</p></details>
       <details class="rv"><summary>مسموح أحمل أي حاجة؟</summary><p>حمّل المحتوى اللي ليك حق فيه أو المسموح تحميله بس، والمسؤولية على المستخدم.</p></details>
     </div>
   </section>
@@ -1125,15 +2034,38 @@ $('paste').onclick = async () => {
   catch(e){ $('url').focus(); showErr('المتصفح مانع اللصق التلقائي.. اضغط مطولا على الخانة والصق بإيدك 📋'); }
 };
 $('url').addEventListener('keydown', e => { if(e.key==='Enter') analyze(); });
+$('ckBtn').onclick = () => $('ckFile').click();
+$('ckFile').addEventListener('change', async e => {
+  const f = e.target.files[0]; if(!f) return;
+  try{
+    const txt = await f.text();
+    const d = await api('/api/cookies', {content: txt});
+    $('ckState').textContent = '🍪 الكوكيز شغالة ('+d.domains+' موقع)';
+    toast('الكوكيز اتشالت معانا ✅');
+  }catch(err){ showErr(err.message); window.scrollTo({top:0,behavior:'smooth'}); }
+  e.target.value = '';
+});
 $('go').onclick = analyze;
+
+function renderSearch(list){
+  if(!list || !list.length){ showErr('مفيش نتايج يا معلم، جرب كلمات تانية 🔎'); return; }
+  let html = '<div class="gt">🔎 نتايج البحث<small>اختار الفيديو اللي تقصده</small></div>';
+  html += list.map((r,i)=>'<button class="sitem" data-i="'+i+'">'
+    +(r.thumb?'<img src="'+esc(r.thumb)+'" loading="lazy" referrerpolicy="no-referrer">':'<span class="nothumb">🎬</span>')
+    +'<span class="si"><b>'+esc(r.title||'فيديو')+'</b><small>'+esc([r.channel,r.duration].filter(Boolean).join(' • '))+'</small></span></button>').join('');
+  const box=$('sres'); box.innerHTML=html; box.classList.add('show');
+  box.querySelectorAll('.sitem').forEach(b=> b.onclick=()=>{ const r=list[+b.dataset.i];
+    $('url').value='https://www.youtube.com/watch?v='+r.id; box.classList.remove('show'); analyze(); });
+}
 
 async function analyze(){
   hideErr();
+  $('sres').classList.remove('show');
   const url = $('url').value.trim();
   if(!url){ showErr('يا عم انت كده مش لاعب.. حط لينك الاول 😅'); return; }
   $('go').disabled = true; $('go').textContent='⏳ بنحلل...';
   $('result').classList.remove('show'); $('loader').classList.add('show');
-  try{ const d = await api('/api/info', {url}); token = d.token; renderResult(d); }
+  try{ const d = await api('/api/info', {url}); if(d.search){ renderSearch(d.results); return; } token = d.token; renderResult(d); }
   catch(e){ showErr(e.message); }
   finally{ $('go').disabled = false; $('go').textContent='حلّل ✨'; $('loader').classList.remove('show'); }
 }
@@ -1141,9 +2073,10 @@ async function analyze(){
 const GROUPS = {
   ready:['📹 جاهز للتشغيل','صوت وصورة في ملف واحد'],
   video:['🎞️ فيديو بس','جودة عالية من غير صوت'],
-  audio:['🎧 صوت بس','للأغاني والبودكاست']
+  audio:['🎧 صوت بس','للأغاني والبودكاست'],
+  subs:['📝 ترجمات','SRT للمشاهدة • VTT للويب • TXT للقراءة']
 };
-const SRC = {youtube:'يوتيوب',vidoba:'فيدوبا',tiktok:'تيك توك',direct:'لينك مباشر'};
+const SRC = {youtube:'يوتيوب',vidoba:'فيدوبا',tiktok:'تيك توك',direct:'لينك مباشر',vimeo:'فيميو',dailymotion:'ديلي موشن',mailru:'ميل رو',soundcloud:'ساوند كلاود',instagram:'انستجرام',okru:'أوكي',matchtv:'ماتش تي في',pinterest:'بينترست',facebook:'فيسبوك',vk:'VK',ytdlp:'الويب 🌍'};
 
 function renderResult(d){
   const m = d.meta, th = $('rThumb');
@@ -1157,7 +2090,7 @@ function renderResult(d){
   tags.push('🎯 '+d.options.length+' اختيار');
   $('rMeta').innerHTML = tags.map(t=>'<span class="tag">'+esc(t)+'</span>').join('');
   let html='';
-  for(const g of ['ready','video','audio']){
+  for(const g of ['ready','video','audio','subs']){
     const list = d.options.filter(o=>o.group===g);
     if(!list.length) continue;
     html += '<div class="gt">'+GROUPS[g][0]+' <small>'+GROUPS[g][1]+'</small></div>';
@@ -1226,7 +2159,7 @@ document.querySelectorAll('.card').forEach(c=>c.addEventListener('pointermove',e
 const io = new IntersectionObserver(es=>es.forEach(x=>{ if(x.isIntersecting){ x.target.classList.add('in'); io.unobserve(x.target);} }),{threshold:.12});
 document.querySelectorAll('.rv').forEach((el,i)=>{ el.style.transitionDelay=(i%4)*70+'ms'; io.observe(el); });
 
-fetch('/api/ping').then(r=>r.json()).then(d=>{ $('ver').textContent='v'+d.version; }).catch(()=>{});
+fetch('/api/ping').then(r=>r.json()).then(d=>{ $('ver').textContent='v'+d.version; if(d.cookies>0) $('ckState').textContent='🍪 الكوكيز شغالة ('+d.cookies+' موقع)'; }).catch(()=>{});
 if(DEMO){
   document.querySelectorAll('.rv').forEach(e=>e.classList.add('in'));
   renderResult({token:'x',meta:{title:'فيديو تجريبي: رحلة حول العالم بجودة عالية 4K',author:'قناة سحّاب',duration:'12:34',thumb:'',source:'youtube'},
@@ -1272,7 +2205,8 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             return self._send(200, PAGE, "text/html; charset=utf-8")
         if path == "/api/ping":
-            return self._json({"ok": True, "version": VERSION})
+            return self._json({"ok": True, "version": VERSION,
+                               "cookies": _COOKIES_COUNT, "ytdlp": HAS_YTDLP})
         if path == "/api/jobs":
             with JOBS_LOCK:
                 jobs = sorted(JOBS.values(), key=lambda j: j["ts"], reverse=True)
@@ -1293,7 +2227,9 @@ class Handler(BaseHTTPRequestHandler):
         size = os.path.getsize(p)
         name = os.path.basename(p)
         ctype = {"mp4": "video/mp4", "webm": "video/webm", "m4a": "audio/mp4", "mp3": "audio/mpeg",
-                 "ts": "video/mp2t"}.get(name.rsplit(".", 1)[-1].lower(), "application/octet-stream")
+                 "ts": "video/mp2t", "srt": "application/x-subrip; charset=utf-8",
+                 "vtt": "text/vtt; charset=utf-8", "txt": "text/plain; charset=utf-8",
+                 "jpg": "image/jpeg"}.get(name.rsplit(".", 1)[-1].lower(), "application/octet-stream")
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(size))
@@ -1321,11 +2257,16 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/info":
                 url = normalize_url(body.get("url"))
                 if url is None:
-                    return self._json({"error": MSG["empty_url"] if not (body.get("url") or "").strip() else MSG["bad_url"]}, 400)
+                    q = (body.get("url") or "").strip()
+                    if not q:
+                        return self._json({"error": MSG["empty_url"]}, 400)
+                    return self._json({"search": True, "results": youtube_search(q, 8)})
                 return self._json(analyze(url))
             if path == "/api/download":
                 jid = start_job(body.get("token"), body.get("option"))
                 return self._json({"id": jid})
+            if path == "/api/cookies":
+                return self._json(save_cookies(body.get("content") or ""))
             if path == "/api/cancel":
                 with JOBS_LOCK:
                     j = JOBS.get(body.get("id"))
@@ -1396,7 +2337,15 @@ def _self_test():
     check("notyoutube.com", route("https://notyoutube.com/watch?v=dQw4w9WgXcQ") != "youtube")
     check("route tiktok", route("https://www.tiktok.com/@a/video/1") == "tiktok")
     check("route direct", route("https://cdn.example.com/v/x.mp4?token=1") == "direct")
-    check("route unknown", route("https://www.facebook.com/watch/?v=1") == "unknown")
+    check("route facebook", route("https://www.facebook.com/watch/?v=1") == "facebook")
+    check("route vimeo", route("https://vimeo.com/12345") == "vimeo")
+    check("route dailymotion", route("https://www.dailymotion.com/video/x8abc") == "dailymotion")
+    check("route dai.ly", route("https://dai.ly/x8abc") == "dailymotion")
+    check("route instagram", route("https://www.instagram.com/reel/ABC123/") == "instagram")
+    check("route soundcloud", route("https://soundcloud.com/a/b") == "soundcloud")
+    check("route vk", route("https://vk.com/video-1_456") == "vk")
+    check("route pinterest", route("https://www.pinterest.com/pin/123/") == "pinterest")
+    check("route unknown", route("https://example.com/watch?v=1") == "unknown")
     check("sanitize", sanitize_filename('a/b\\c:d|e*f?g"h<i>j', "mp4") == "a-b-c-d-efg'h(i)j.mp4")
     check("sanitize empty", sanitize_filename("", "mp4") == "video.mp4")
     check("ext query", get_extension_from_url("https://x.com/a/b.mp4?token=zzz") == "mp4")
@@ -1411,6 +2360,28 @@ def _self_test():
     up = unpack_packer(packed)
     check("packer", up is not None and up.strip() == "hello world")
     check("master m3u8", parse_master_m3u8("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100,RESOLUTION=640x360\na.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=200,RESOLUTION=1280x720\nb.m3u8\n")[0]["height"] == 720)
+
+    print("== مميزات v3 ==")
+    check("علم yt-dlp", isinstance(HAS_YTDLP, bool))
+    _vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nأهلا <b>يا</b> دنيا\n\n00:00:04.000 --> 00:00:05.500\nسطر تاني\n"
+    _srt = vtt_to_srt(_vtt)
+    check("vtt->srt ترقيم", _srt.startswith("1\n00:00:01,000 --> 00:00:03,000\n"))
+    check("vtt->srt شيل الوسوم", "أهلا يا دنيا" in _srt)
+    check("vtt->txt بدون تكرار", "أهلا يا دنيا" in vtt_to_txt(_vtt))
+    _xml = '<transcript><text start="1.5" dur="2">أول &amp; سطر</text></transcript>'
+    check("xml->vtt", "00:00:01.500 --> 00:00:03.500" in xml_captions_to_vtt(_xml) and "أول & سطر" in xml_captions_to_vtt(_xml))
+    _ck = "# Netscape HTTP Cookie File\n.example.com\tTRUE\t/\tFALSE\t2000000000\tsid\tabc123\n"
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as _cf:
+        _cf.write(_ck)
+    check("تحميل كوكيز", load_cookies_file(_cf.name) == 1)
+    check("كوكيز للينك", "sid=abc123" in (cookies_for("https://example.com/x") or ""))
+    check("كوكيز مش لينك تاني", cookies_for("https://other.org/x") == "")
+    os.unlink(_cf.name)
+    check("ليبل محرك", _eng_label("📹 HD 720p (كل الجودات)") == ("HD 720p", "كل الجودات"))
+    _eo = _eng_options([{"type": "file", "url": "https://x/v.mp4", "ext": "mp4", "label": "📹 720p"},
+                        {"type": "file", "url": "https://x/a.mp3", "ext": "mp3", "label": "🎧 mp3"},
+                        {"type": "hls", "url": "https://x/m.m3u8", "ext": "ts", "label": "📺 بث HLS", "advanced": True}])
+    check("تحويل اختيارات", [o["group"] for o in _eo] == ["ready", "audio", "video"] and _eo[2]["type"] == "hls")
 
     print("== الواجهة والسيرفر (محلي) ==")
     global OUTDIR
@@ -1445,8 +2416,14 @@ def _self_test():
     check("الصفحة الرئيسية", st == 200 and "سحّاب".encode() in html)
     st, b = call("/api/info", {"url": ""})
     check("لينك فاضي", st == 400 and "error" in json.loads(b))
-    st, b = call("/api/info", {"url": "https://www.facebook.com/watch/?v=1"})
-    check("موقع مش مدعوم", st == 400)
+    _orig_search = globals().get("youtube_search")
+    globals()["youtube_search"] = lambda q, limit=8: [
+        {"id": "dQw4w9WgXcQ", "title": "نتيجة", "channel": "قناة", "duration": "1:00", "views": "", "thumb": ""}]
+    st, b = call("/api/info", {"url": "hello world"})
+    _sr = json.loads(b)
+    check("بحث بالكلمات", st == 200 and _sr.get("search") and _sr["results"][0]["id"] == "dQw4w9WgXcQ")
+    if _orig_search is not None:
+        globals()["youtube_search"] = _orig_search
     st, b = call("/api/info", {"url": "http://127.0.0.1:%d/clip.mp4" % fs.server_address[1]})
     # route بيطلب دومين فيه نقطة، فاللينك المحلي غالبا يترفض: نختبر بـ localhost عبر دالة مباشرة
     if st != 200:

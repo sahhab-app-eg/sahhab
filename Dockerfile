@@ -1,4 +1,5 @@
 FROM python:3.11-slim
+RUN pip install --no-cache-dir yt-dlp
 RUN useradd -m -u 1000 user
 USER user
 ENV HOME=/home/user SAHHAB_HOST=0.0.0.0 PORT=7860 SAHHAB_DIR=/home/user/Sahhab PYTHONUNBUFFERED=1
