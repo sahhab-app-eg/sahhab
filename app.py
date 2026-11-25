@@ -29,7 +29,7 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 PORT = 8765
 
 # ---------------------------------------------------------------
@@ -352,7 +352,9 @@ def youtube_formats(video_id):
         ps = resp.get("playabilityStatus") or {}
         status = ps.get("status")
         if status == "LOGIN_REQUIRED":
-            raise LoginRequired(MSG["login_required"])
+            last_err = LoginRequired(MSG["login_required"])
+            resp = None
+            continue
         if status and status != "OK":
             last_err = NotPlayable(ps.get("reason") or status)
             resp = None
@@ -1154,6 +1156,7 @@ def ytdlp_extract(url):
         raise SahhabError(MSG["need_ytdlp"])
     opts = {"quiet": True, "no_warnings": True, "skip_download": True,
             "noplaylist": True, "socket_timeout": 30,
+            "js_runtimes": {"node": {}, "deno": {}},
             "http_headers": {"User-Agent": UA_PHONE}}
     if _COOKIES_FILE:
         opts["cookiefile"] = _COOKIES_FILE
@@ -1461,31 +1464,37 @@ def analyze(url):
         vid = extract_youtube_id(url)
         if not vid:
             raise SahhabError(MSG["no_youtube_id"])
-        m, progressive, adaptive, audio = youtube_formats(vid)
-        meta.update(title=m["title"], author=m["author"], thumb=m["thumb"],
-                    duration=clock(m["lengthSeconds"]) if m["lengthSeconds"] else "")
-        for f in progressive:
-            ext = "mp4" if "mp4" in (f.get("mimeType") or "") else "webm"
-            options.append(dict(group="ready", quality=f.get("qualityLabel") or "?", ext=ext,
-                                size=_csize(f), type="file", url=f["url"], headers={}))
-        for f in adaptive[:4]:
-            ext = "mp4" if "mp4" in (f.get("mimeType") or "") else "webm"
-            options.append(dict(group="video", quality=f.get("qualityLabel") or "?", ext=ext,
-                                size=_csize(f), type="file", url=f["url"], headers={}))
-        if audio:
-            f = audio[0]
-            options.append(dict(group="audio", quality="m4a", ext="m4a",
-                                size=_csize(f), type="file", url=f["url"], headers={}))
         try:
-            tracks = youtube_caption_tracks(vid)
-        except Exception:  # noqa: BLE001
-            tracks = []
-        for t in tracks:
-            nm = t["name"] + (" (اوتوماتيك)" if t["auto"] else "")
-            for fmt in ("srt", "vtt", "txt"):
-                options.append(dict(group="subs", quality=nm, ext=fmt, size=None,
-                                    type="subs", url="", headers={},
-                                    track=t, lang=t["lang"]))
+            m, progressive, adaptive, audio = youtube_formats(vid)
+        except Exception:  # noqa: BLE001 - المحرك المخصص اتمنع، نكمل بالمحرك العام (yt-dlp مع PO tokens)
+            title, eng_options = ytdlp_extract(url)
+            meta["title"] = title or ""
+            options = _eng_options(eng_options)
+        else:
+            meta.update(title=m["title"], author=m["author"], thumb=m["thumb"],
+                        duration=clock(m["lengthSeconds"]) if m["lengthSeconds"] else "")
+            for f in progressive:
+                ext = "mp4" if "mp4" in (f.get("mimeType") or "") else "webm"
+                options.append(dict(group="ready", quality=f.get("qualityLabel") or "?", ext=ext,
+                                    size=_csize(f), type="file", url=f["url"], headers={}))
+            for f in adaptive[:4]:
+                ext = "mp4" if "mp4" in (f.get("mimeType") or "") else "webm"
+                options.append(dict(group="video", quality=f.get("qualityLabel") or "?", ext=ext,
+                                    size=_csize(f), type="file", url=f["url"], headers={}))
+            if audio:
+                f = audio[0]
+                options.append(dict(group="audio", quality="m4a", ext="m4a",
+                                    size=_csize(f), type="file", url=f["url"], headers={}))
+            try:
+                tracks = youtube_caption_tracks(vid)
+            except Exception:  # noqa: BLE001
+                tracks = []
+            for t in tracks:
+                nm = t["name"] + (" (اوتوماتيك)" if t["auto"] else "")
+                for fmt in ("srt", "vtt", "txt"):
+                    options.append(dict(group="subs", quality=nm, ext=fmt, size=None,
+                                        type="subs", url="", headers={},
+                                        track=t, lang=t["lang"]))
 
     elif kind == "vidoba":
         host = urllib.parse.urlsplit(url).netloc.lower()
