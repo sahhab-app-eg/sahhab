@@ -1167,7 +1167,8 @@ def ytdlp_extract(url):
         low = str(e).lower()
         if "unsupported url" in low:
             raise SahhabError(MSG["unsupported"])
-        if any(k in low for k in ("login", "sign in", "cookies", "private", "403")):
+        if any(k in low for k in ("login", "sign in", "cookies", "private", "403",
+                                  "failed to extract any player response", "not a bot")):
             raise SahhabError(MSG["ytdlp_login"] + "\n" + MSG["cookies_howto"])
         raise SahhabError(MSG["ytdlp_fail"] % str(e).split('\n')[0][:120])
     if not info:
