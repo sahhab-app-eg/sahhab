@@ -1143,6 +1143,9 @@ def soundcloud_extract(url):
 # ---------------------------------------------------------------
 # المحرك العام (yt-dlp) - لاي موقع تاني: بيشتغل لو yt-dlp متسطب
 # ---------------------------------------------------------------
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
+import yt_chain  # noqa: E402  (vendored EJS solver path must be set first)
+
 try:
     import yt_dlp  # type: ignore
     HAS_YTDLP = True
@@ -1160,6 +1163,10 @@ def ytdlp_extract(url):
             "http_headers": {"User-Agent": UA_PHONE}}
     if _COOKIES_FILE:
         opts["cookiefile"] = _COOKIES_FILE
+    if yt_chain.have_youtube_auth():
+        # Bearer OAuth (TV client) + PS4 UA + POT + patched n-solver; the
+        # extractor args only activate for YouTube URLs.
+        opts.update(yt_chain.chain_opts())
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
