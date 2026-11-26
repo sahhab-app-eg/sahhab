@@ -4,7 +4,7 @@ FROM python:3.11-slim
 COPY --from=node:22-slim /usr/local /usr/local
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates curl unzip \
+    && apt-get install -y --no-install-recommends git ca-certificates curl unzip ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Deno (JS runtime for yt-dlp's YouTube n-challenge solver)
