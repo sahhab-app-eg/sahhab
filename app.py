@@ -1283,6 +1283,11 @@ except ImportError:
     HAS_YTDLP = False
 
 
+def _ytdlp_base_opts():
+    return {"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 30,
+            "js_runtimes": {"node": {}, "deno": {}}}
+
+
 def ytdlp_extract(url):
     """بيرجع (title, options). كل option: {type: file|hls, url, ext, label, headers}."""
     if not HAS_YTDLP:
@@ -1328,6 +1333,29 @@ def ytdlp_extract(url):
         if f.get("height"):
             return "%dp" % f["height"]
         return f.get("format_note") or f.get("resolution") or "؟"
+
+    merged = []
+    if yt_chain.have_youtube_auth() and "youtu" in (url or ""):
+        has_aud = any(f.get("url") and f.get("acodec") not in (None, "none")
+                      and f.get("vcodec") in (None, "none") and f.get("ext") == "m4a" for f in fmts)
+        aud_sz = max([int(f.get("filesize") or f.get("filesize_approx") or 0) for f in fmts
+                      if f.get("ext") == "m4a" and f.get("vcodec") in (None, "none")] or [0])
+        seen_h = {}
+        for f in fmts:
+            if (f.get("url") and f.get("ext") == "mp4" and f.get("acodec") in (None, "none")
+                    and str(f.get("vcodec") or "").startswith("avc1")
+                    and 360 < int(f.get("height") or 0) <= 1080):
+                h = int(f["height"])
+                sz = int(f.get("filesize") or f.get("filesize_approx") or 0)
+                if h not in seen_h or sz > seen_h[h]:
+                    seen_h[h] = sz
+        if has_aud:
+            for h in sorted(seen_h, reverse=True):
+                sz = seen_h[h] + aud_sz if seen_h[h] else 0
+                merged.append({"type": "ytmerge", "url": url, "ext": "mp4", "headers": {},
+                               "height": h,
+                               "label": MSG["ytdlp_ready"] % ("%dp" % h, "mp4", human_size(sz) if sz else MSG["size_unknown"])})
+    options.extend(merged)
 
     progressive = [f for f in fmts if f.get("url")
                    and f.get("vcodec") not in (None, "none")
@@ -1588,7 +1616,8 @@ def _eng_options(eng_options):
         group = "audio" if audio else ("video" if o.get("advanced") else "ready")
         out.append(dict(group=group, quality=lab, ext=ext, size=None,
                         type=o.get("type") or "file", url=o["url"],
-                        headers=o.get("headers") or {}, note=note))
+                        headers=o.get("headers") or {}, note=note,
+                        **({"height": o["height"]} if o.get("height") else {})))
     return out
 
 
@@ -1751,6 +1780,10 @@ def _run_job(job, opt, title):
             path, size = download_caption(opt["track"], opt["ext"], dest)
         elif opt["type"] == "hls":
             path, size = hls_download(opt["url"], dest, headers=opt["headers"], on_progress=prog, cancel=cancel)
+        elif opt["type"] == "ytmerge":
+            path, size = yt_chain.download_merged(opt["url"], dest, opt["height"],
+                                                  on_progress=prog, cancel=cancel,
+                                                  base_opts=_ytdlp_base_opts())
         elif opt["type"] == "tiktok":
             err = None
             path = None

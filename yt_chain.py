@@ -163,7 +163,7 @@ def chain_opts():
     install()
     return {
         "extractor_args": {
-            "youtube": {"player_client": ["tv"], "player_skip": ["webpage", "configs"]},
+            "youtube": {"player_client": ["tv_embedded"], "player_skip": ["webpage", "configs"]},
             "youtubepot-bgutilhttp": {"base_url": ["http://127.0.0.1:4416"]},
             # dev mode: our vendored solver build (upstream 0.8.0 + PR #80)
             # intentionally differs from the pinned release hash.
@@ -171,3 +171,65 @@ def chain_opts():
         },
         "remote_components": ["ejs:github"],
     }
+
+
+def download_merged(url, dest, height, on_progress=None, cancel=None, base_opts=None):
+    """Download video(avc1, <=height) + m4a audio with yt-dlp, merge to mp4 via ffmpeg.
+
+    Same chain (Bearer + proxy + n-solver) as extraction. Returns (path, size).
+    """
+    import glob
+    import yt_dlp  # type: ignore
+
+    class _Cancel(Exception):
+        pass
+
+    base = os.path.splitext(dest)[0]
+    state = {"t0": time.time(), "n": 0, "total": 0, "done": 0}
+
+    def hook(d):
+        if cancel is not None and cancel.is_set():
+            raise _Cancel()
+        if d.get("status") == "downloading" and on_progress:
+            tot = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            got = d.get("downloaded_bytes") or 0
+            on_progress(got, tot or None, d.get("speed") or 0, d.get("eta"))
+
+    opts = dict(base_opts or {})
+    opts.update(chain_opts())
+    opts.update({
+        "outtmpl": base + ".%(ext)s",
+        "format": ("bv*[height<=%d][vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[ext=mp4]" % int(height)),
+        "merge_output_format": "mp4",
+        "progress_hooks": [hook],
+        "noprogress": True,
+        "concurrent_fragment_downloads": 1,
+    })
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except _Cancel:
+        for f in glob.glob(base + ".*"):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        from_app = sys.modules.get("__main__") or sys.modules.get("app")
+        exc = getattr(from_app, "Cancelled", Exception)
+        raise exc()
+    except Exception as e:  # noqa: BLE001
+        for f in glob.glob(base + ".*"):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        if "cancel" in type(e).__name__.lower():
+            raise
+        raise RuntimeError(str(e).split("\n")[0][:140])
+    out = base + ".mp4"
+    if not os.path.exists(out):
+        cands = [f for f in glob.glob(base + ".*") if not f.endswith((".part", ".ytdl"))]
+        if not cands:
+            raise RuntimeError("no output")
+        out = cands[0]
+    return out, os.path.getsize(out)
