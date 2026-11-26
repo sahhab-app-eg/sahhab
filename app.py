@@ -1848,7 +1848,7 @@ def start_job(token, opt_id):
         "id": jid, "state": "queued", "title": info["meta"]["title"], "thumb": info["meta"].get("thumb", ""),
         "quality": opt["quality"], "ext": opt["ext"], "pct": 0, "done": 0, "total": None,
         "speed": "", "eta": "", "file": "", "path": "", "error": "", "size": "", "segments": False,
-        "ts": time.time(), "_cancel": threading.Event(),
+        "ts": time.time(), "_cancel": threading.Event()
     }
     with JOBS_LOCK:
         JOBS[jid] = job
@@ -2177,7 +2177,6 @@ footer .mark{width:32px;height:32px;border-radius:10px}.footer .mark svg{width:1
     <p class="lead">كل حاجة بتنزل قدامك لحظة بلحظة.</p>
     <div id="jobs"></div>
     <div class="empty" id="empty"><big>🚀</big>مفيش تحميلات لسه.. الصق لينك وابدأ</div>
-    <div class="saved" id="saved"></div>
   </section>
 
   <section class="sec" id="how">
@@ -2338,15 +2337,14 @@ function jobHtml(j){
     +'<div class="jb"><div class="jt">'+esc(j.title)+'<small>'+esc(j.quality)+'</small></div><div class="js">'+status+'</div></div><div class="act">'+act+'</div></div>';
 }
 
-function paintJobs(jobs, dir){
+function paintJobs(jobs){
   $('jobs').innerHTML = jobs.map(jobHtml).join('');
   $('empty').style.display = jobs.length ? 'none' : '';
   $('cnt').style.display = jobs.length ? '' : 'none'; $('cnt').textContent = jobs.length;
   $('jobs').querySelectorAll('[data-cancel]').forEach(b=> b.onclick = ()=> api('/api/cancel',{id:b.dataset.cancel}).then(refresh));
-  if(dir) $('saved').innerHTML = '📁 الملفات بتتحفظ في: <code>'+esc(dir)+'</code>';
 }
 async function refresh(){
-  try{ const d = await api('/api/jobs'); paintJobs(d.jobs, d.dir); return d.jobs.some(j=>j.state==='running'||j.state==='queued'); }
+  try{ const d = await api('/api/jobs'); paintJobs(d.jobs); return d.jobs.some(j=>j.state==='running'||j.state==='queued'); }
   catch(e){ return false; }
 }
 function poll(){
@@ -2371,7 +2369,7 @@ if(DEMO){
     {id:2,group:'video',quality:'1080p',ext:'mp4',size:'96.1 ميجا'},{id:3,group:'audio',quality:'m4a',ext:'m4a',size:'9.4 ميجا'}]});
   paintJobs([{id:'a',state:'running',title:'رحلة حول العالم',quality:'720p',pct:64,detail:'31 ميجا / 48 ميجا',speed:'3.2 ميجا/ث',eta:'5 ثانية'},
     {id:'b',state:'done',title:'أغنية جميلة',quality:'m4a',pct:100,size:'9.4 ميجا',file:'song.m4a',can_get:true},
-    {id:'c',state:'error',title:'فيديو فاشل',quality:'1080p',pct:10,error:'النت عمل حجرة ورقة مقص وخسرنا'}],'/storage/emulated/0/Download/Sahhab');
+    {id:'c',state:'error',title:'فيديو فاشل',quality:'1080p',pct:10,error:'النت عمل حجرة ورقة مقص وخسرنا'}]);
 } else { refresh().then(a=>{ if(a) poll(); }); }
 </script>
 </body>
@@ -2423,7 +2421,7 @@ class Handler(BaseHTTPRequestHandler):
             with JOBS_LOCK:
                 jobs = sorted(JOBS.values(), key=lambda j: j["ts"], reverse=True)
                 data = [public_job(j) for j in jobs[:30]]
-            return self._json({"jobs": data, "dir": OUTDIR})
+            return self._json({"jobs": data})
         if path.startswith("/file/"):
             return self._file(path[6:])
         if path == "/favicon.ico":
