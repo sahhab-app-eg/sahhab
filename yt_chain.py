@@ -12,9 +12,15 @@ Nothing here is logged.
 """
 import json
 import os
+import sys
 import time
 import urllib.parse
 import urllib.request
+
+
+def _log(msg):
+    # diagnostics only; never log token material
+    print("[yt_chain] " + msg, file=sys.stderr, flush=True)
 
 PS4_UA = ("Mozilla/5.0 (PlayStation; PlayStation 4/12.00) "
           "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15")
@@ -47,10 +53,15 @@ def get_access_token():
         "grant_type": "refresh_token",
     }).encode()
     req = urllib.request.Request("https://oauth2.googleapis.com/token", data=body)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.load(r)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.load(r)
+    except Exception as e:  # noqa: BLE001
+        _log("token refresh FAILED: %s" % type(e).__name__)
+        raise
     _access_token = data["access_token"]
     _access_exp = now + float(data.get("expires_in", 3600))
+    _log("access token refreshed, expires_in=%s" % data.get("expires_in"))
     return _access_token
 
 
@@ -78,14 +89,24 @@ def install():
                 headers["Authorization"] = "Bearer " + token
             headers["User-Agent"] = PS4_UA
             kwargs["headers"] = headers
+            resp = orig(self, ep, *args, **kwargs)
+            try:
+                ps = (resp or {}).get("playabilityStatus") or {}
+                _log("player response: status=%s reason=%s" % (
+                    ps.get("status"), (ps.get("reason") or "")[:60]))
+            except Exception:  # noqa: BLE001
+                pass
+            return resp
         return orig(self, ep, *args, **kwargs)
 
     _base.YoutubeBaseInfoExtractor._call_api = patched
     _installed = True
+    _log("monkeypatch installed (tv client, PS4 UA, Bearer on player calls)")
 
 
 def chain_opts():
     """Extra YoutubeDL opts: tv client, POT provider, patched EJS solver."""
+    _log("chain active, refresh token present")
     install()
     return {
         "extractor_args": {

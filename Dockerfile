@@ -12,7 +12,7 @@ RUN curl -fsSL -o /tmp/deno.zip https://github.com/denoland/deno/releases/latest
     && unzip -o /tmp/deno.zip -d /usr/local/bin \
     && rm /tmp/deno.zip && deno --version
 
-RUN pip install --no-cache-dir -U yt-dlp bgutil-ytdlp-pot-provider==2.0.2
+RUN pip install --no-cache-dir "yt-dlp==2026.10.21.202512.dev0" bgutil-ytdlp-pot-provider==2.0.2
 
 RUN useradd -m -u 1000 user
 USER user
