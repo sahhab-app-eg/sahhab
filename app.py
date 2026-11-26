@@ -32,6 +32,136 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 VERSION = "3.1.0"
 PORT = 8765
 
+# الـ sidecar: نسخة تانية من التطبيق على استضافة IP نضيف ليوتيوب.
+# لما YT_SIDECAR_URL يتظبط، تحليل وتحميل لينكات يوتيوب بيعدّوا منه.
+# SAHHAB_SIDECAR_KEY مفتاح مشترك بين الموقع والـ sidecar.
+# على الـ sidecar نفسه (من غير YT_SIDECAR_URL) المفتاح مطلوب في هيدر X-Sahhab-Key.
+SIDECAR = (os.environ.get("YT_SIDECAR_URL") or "").rstrip("/")
+SIDECAR_KEY = os.environ.get("SAHHAB_SIDECAR_KEY") or ""
+SIDECAR_INFOS = {}   # token -> {"pub": رد الـ sidecar, "ts": وقت} للينكات اللي اتحللت هناك
+
+
+def sidecar_call(path, payload, timeout=180):
+    """POST JSON للـ sidecar. بيرمي استثناء لو الاتصال فشل."""
+    req = urllib.request.Request(
+        SIDECAR + path, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "X-Sahhab-Key": SIDECAR_KEY})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def sidecar_get(path, timeout=30):
+    """GET JSON من الـ sidecar."""
+    req = urllib.request.Request(SIDECAR + path, headers={"X-Sahhab-Key": SIDECAR_KEY})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def sidecar_info(url):
+    """بيحلل لينك يوتيوب عن طريق الـ sidecar. بيرجع الرد الجاهز أو None لو فشل."""
+    try:
+        resp = sidecar_call("/api/info", {"url": url})
+    except Exception:  # noqa: BLE001 - الـ sidecar مش متاح، نكمل محلي
+        return None
+    if not isinstance(resp, dict) or not resp.get("token"):
+        return None
+    with INFOS_LOCK:
+        SIDECAR_INFOS[resp["token"]] = {"pub": resp, "ts": time.time()}
+        if len(SIDECAR_INFOS) > 60:
+            for k in sorted(SIDECAR_INFOS, key=lambda k: SIDECAR_INFOS[k]["ts"])[:20]:
+                SIDECAR_INFOS.pop(k, None)
+    return resp
+
+
+def _run_sidecar_job(job, sid):
+    """بيتابع تحميل على الـ sidecar ولما يخلص بيسحب الملف عندنا."""
+    cancel = job["_cancel"]
+
+    def prog(done, total, spd, eta, segments=False):
+        job["done"], job["total"] = done, total
+        job["speed"] = human_size(spd) + "/ث" if spd else ""
+        job["eta"] = human_time(eta) if eta is not None else ""
+        job["pct"] = round(done * 100.0 / total, 1) if total else 0
+
+    try:
+        remote = None
+        deadline = time.time() + 3600
+        job["state"] = "running"
+        while time.time() < deadline:
+            if cancel.is_set():
+                try:
+                    sidecar_call("/api/cancel", {"id": sid}, timeout=15)
+                except Exception:  # noqa: BLE001
+                    pass
+                raise Cancelled()
+            try:
+                jobs = sidecar_get("/api/jobs", timeout=20).get("jobs", [])
+            except Exception:  # noqa: BLE001 - مشكلة شبكة مؤقتة، نحاول تاني
+                time.sleep(3)
+                continue
+            remote = next((j for j in jobs if j.get("id") == sid), None)
+            if remote is None:
+                raise SahhabError(MSG["fail_final"])
+            job["pct"] = remote.get("pct", 0)
+            job["speed"] = remote.get("speed", "")
+            job["eta"] = remote.get("eta", "")
+            if remote.get("state") == "done":
+                break
+            if remote.get("state") in ("error", "cancelled"):
+                raise SahhabError(remote.get("error") or MSG["fail_final"])
+            time.sleep(2)
+        else:
+            raise SahhabError(MSG["fail_final"])
+        fname = remote.get("file") or "video.mp4"
+        dest = unique_path(os.path.join(OUTDIR, fname))
+        job["file"] = os.path.basename(dest)
+        job["path"] = dest
+        req_url = SIDECAR + "/file/" + urllib.parse.quote(sid)
+        path, size = download_file(req_url, dest, headers={"X-Sahhab-Key": SIDECAR_KEY},
+                                   on_progress=prog, cancel=cancel)
+        job.update(state="done", pct=100, size=human_size(size), speed="", eta="", path=path)
+    except Cancelled:
+        job.update(state="cancelled", error=MSG["cancelled"], speed="", eta="")
+        try:
+            if job.get("path") and os.path.exists(job["path"]):
+                os.remove(job["path"])
+        except OSError:
+            pass
+    except Exception as e:  # noqa: BLE001
+        job.update(state="error", error=str(e) if isinstance(e, SahhabError) else MSG["fail_final"] + " (%s)" % e,
+                   speed="", eta="")
+
+
+def start_sidecar_job(token, opt_id):
+    with INFOS_LOCK:
+        entry = SIDECAR_INFOS.get(token)
+    if not entry:
+        raise SahhabError("الجلسة انتهت.. اعمل تحليل للينك تاني 🔄")
+    pub = entry["pub"]
+    try:
+        opt = pub["options"][int(opt_id)]
+    except (ValueError, IndexError):
+        raise SahhabError("الاختيار ده مش موجود")
+    try:
+        resp = sidecar_call("/api/download", {"token": token, "option": int(opt_id)})
+    except Exception as e:  # noqa: BLE001
+        raise SahhabError(MSG["fail_final"] + " (%s)" % e)
+    sid = resp.get("id")
+    if not sid:
+        raise SahhabError(MSG["fail_final"])
+    meta = pub.get("meta") or {}
+    jid = uuid.uuid4().hex[:10]
+    job = {
+        "id": jid, "state": "queued", "title": meta.get("title", ""), "thumb": meta.get("thumb", ""),
+        "quality": opt.get("quality", ""), "ext": opt.get("ext", ""), "pct": 0, "done": 0, "total": None,
+        "speed": "", "eta": "", "file": "", "path": "", "error": "", "size": "", "segments": False,
+        "ts": time.time(), "_cancel": threading.Event(),
+    }
+    with JOBS_LOCK:
+        JOBS[jid] = job
+    threading.Thread(target=_run_sidecar_job, args=(job, sid), daemon=True).start()
+    return jid
+
 # ---------------------------------------------------------------
 # رسايل مصري
 # ---------------------------------------------------------------
@@ -1651,6 +1781,8 @@ def start_job(token, opt_id):
     with INFOS_LOCK:
         info = INFOS.get(token)
     if not info:
+        if SIDECAR and token in SIDECAR_INFOS:
+            return start_sidecar_job(token, opt_id)
         raise SahhabError("الجلسة انتهت.. اعمل تحليل للينك تاني 🔄")
     try:
         opt = info["options"][int(opt_id)]
@@ -2217,8 +2349,16 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj, ensure_ascii=False))
 
+    def _sidecar_ok(self):
+        # على نسخة الـ sidecar (مفتاح متظبط ومن غير YT_SIDECAR_URL) الهيدر مطلوب
+        if SIDECAR or not SIDECAR_KEY:
+            return True
+        return self.headers.get("X-Sahhab-Key") == SIDECAR_KEY
+
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
+        if not self._sidecar_ok() and (path.startswith("/file/") or path == "/api/jobs"):
+            return self._json({"error": "ممنوع"}, 403)
         if path in ("/", "/index.html"):
             return self._send(200, PAGE, "text/html; charset=utf-8")
         if path == "/api/ping":
@@ -2270,6 +2410,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(n).decode("utf-8") or "{}") if n else {}
         except Exception:  # noqa: BLE001
             return self._json({"error": "الطلب مش مفهوم"}, 400)
+        if not self._sidecar_ok() and path.startswith("/api/"):
+            return self._json({"error": "ممنوع"}, 403)
         try:
             if path == "/api/info":
                 url = normalize_url(body.get("url"))
@@ -2278,8 +2420,14 @@ class Handler(BaseHTTPRequestHandler):
                     if not q:
                         return self._json({"error": MSG["empty_url"]}, 400)
                     return self._json({"search": True, "results": youtube_search(q, 8)})
+                if SIDECAR and route(url) == "youtube":
+                    prox = sidecar_info(url)
+                    if prox is not None:
+                        return self._json(prox)
                 return self._json(analyze(url))
             if path == "/api/download":
+                if not self._sidecar_ok():
+                    return self._json({"error": "ممنوع"}, 403)
                 jid = start_job(body.get("token"), body.get("option"))
                 return self._json({"id": jid})
             if path == "/api/cookies":
