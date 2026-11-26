@@ -195,11 +195,27 @@ def download_merged(url, dest, height, on_progress=None, cancel=None, base_opts=
             got = d.get("downloaded_bytes") or 0
             on_progress(got, tot or None, d.get("speed") or 0, d.get("eta"))
 
+    if int(height) > 1080:
+        # 4K/2K: YouTube serves vp9 (webm) or av01 (mp4) only; no avc1 this high.
+        # Prefer an mp4-container video stream, accept webm otherwise; ffmpeg
+        # remuxes vp9/av01 into the mp4 output fine.
+        fmt = ("bv*[height<=%(h)d][ext=mp4]+ba[ext=m4a]/"
+               "bv*[height<=%(h)d]+ba[ext=m4a]/"
+               "bv*[height<=%(h)d]+ba/"
+               "b[height<=%(h)d]/b") % {"h": int(height)}
+    else:
+        # <=1080p: avc1/mp4 first (original behavior), then generic fallbacks so
+        # the small sizes (144p/240p) still merge when no avc1 stream exists.
+        fmt = ("bv*[height<=%(h)d][vcodec^=avc1][ext=mp4]+ba[ext=m4a]/"
+               "bv*[height<=%(h)d][ext=mp4]+ba[ext=m4a]/"
+               "bv*[height<=%(h)d]+ba[ext=m4a]/"
+               "b[height<=%(h)d]/b[ext=mp4]/b") % {"h": int(height)}
+
     opts = dict(base_opts or {})
     opts.update(chain_opts())
     opts.update({
         "outtmpl": base + ".%(ext)s",
-        "format": ("bv*[height<=%d][vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[ext=mp4]" % int(height)),
+        "format": fmt,
         "merge_output_format": "mp4",
         "progress_hooks": [hook],
         "noprogress": True,
@@ -232,4 +248,79 @@ def download_merged(url, dest, height, on_progress=None, cancel=None, base_opts=
         if not cands:
             raise RuntimeError("no output")
         out = cands[0]
+    return out, os.path.getsize(out)
+
+
+def download_mp3(url, dest, kbps, on_progress=None, cancel=None, base_opts=None):
+    """Best audio (m4a) with yt-dlp, re-encoded to mp3 at kbps via ffmpeg.
+
+    Same chain (Bearer + proxy + n-solver) as extraction. Returns (path, size).
+    """
+    import glob
+    import subprocess
+    import yt_dlp  # type: ignore
+
+    class _Cancel(Exception):
+        pass
+
+    base = os.path.splitext(dest)[0]
+
+    def hook(d):
+        if cancel is not None and cancel.is_set():
+            raise _Cancel()
+        if d.get("status") == "downloading" and on_progress:
+            tot = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            got = d.get("downloaded_bytes") or 0
+            on_progress(got, tot or None, d.get("speed") or 0, d.get("eta"))
+
+    opts = dict(base_opts or {})
+    opts.update(chain_opts())
+    opts.update({
+        "outtmpl": base + ".src.%(ext)s",
+        "format": "ba[ext=m4a]/ba",
+        "progress_hooks": [hook],
+        "noprogress": True,
+        "concurrent_fragment_downloads": 1,
+    })
+    out = base + ".mp3"
+
+    def cleanup():
+        for f in glob.glob(base + ".*"):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        if cancel is not None and cancel.is_set():
+            raise _Cancel()
+        srcs = [f for f in glob.glob(base + ".src.*")
+                if not f.endswith((".part", ".ytdl"))]
+        if not srcs:
+            raise RuntimeError("no audio downloaded")
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", srcs[0], "-vn", "-codec:a", "libmp3lame",
+             "-b:a", "%dk" % int(kbps), out],
+            check=True, capture_output=True, timeout=1800)
+        try:
+            os.remove(srcs[0])
+        except OSError:
+            pass
+    except _Cancel:
+        cleanup()
+        from_app = sys.modules.get("__main__") or sys.modules.get("app")
+        exc = getattr(from_app, "Cancelled", Exception)
+        raise exc()
+    except Exception as e:  # noqa: BLE001
+        cleanup()
+        if "cancel" in type(e).__name__.lower():
+            raise
+        err = ""
+        if isinstance(e, subprocess.CalledProcessError) and e.stderr:
+            err = (e.stderr.decode("utf-8", "replace").strip().splitlines() or [""])[-1][:100]
+        raise RuntimeError(err or str(e).split("\n")[0][:140])
+    if not os.path.exists(out):
+        raise RuntimeError("no output")
     return out, os.path.getsize(out)

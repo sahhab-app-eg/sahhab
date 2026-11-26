@@ -188,6 +188,7 @@ MSG = {
     "ytdlp_ready": "📹 %s %s (%s)",
     "ytdlp_video_only": "🎞️ %s (%s) - فيديو لوحده",
     "ytdlp_audio": "🎧 صوت بس %s (%s)",
+    "ytdlp_mp3": "🎵 MP3 %s (%s)",
 }
 
 UA_PHONE = ("Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 "
@@ -1342,19 +1343,35 @@ def ytdlp_extract(url):
                       if f.get("ext") == "m4a" and f.get("vcodec") in (None, "none")] or [0])
         seen_h = {}
         for f in fmts:
-            if (f.get("url") and f.get("ext") == "mp4" and f.get("acodec") in (None, "none")
-                    and str(f.get("vcodec") or "").startswith("avc1")
-                    and 360 < int(f.get("height") or 0) <= 1080):
-                h = int(f["height"])
-                sz = int(f.get("filesize") or f.get("filesize_approx") or 0)
-                if h not in seen_h or sz > seen_h[h]:
-                    seen_h[h] = sz
+            vc = str(f.get("vcodec") or "")
+            h = int(f.get("height") or 0)
+            if not (f.get("url") and f.get("acodec") in (None, "none") and vc):
+                continue
+            # merged mp4 ladder: avc1/mp4 for 360p-1080p (as before); above
+            # that YouTube only serves vp9/av01 (usually webm) - accept those
+            # up to 2160p; small sizes (144p/240p) in any common codec.
+            # ffmpeg remuxes the video into mp4 together with the m4a audio.
+            hi = vc.startswith(("vp9", "vp09", "av01", "avc1"))
+            ok = (f.get("ext") == "mp4" and vc.startswith("avc1") and 360 < h <= 1080) or \
+                 (hi and 1080 < h <= 2160) or \
+                 (hi and h in (144, 240))
+            if not ok:
+                continue
+            sz = int(f.get("filesize") or f.get("filesize_approx") or 0)
+            if h not in seen_h or sz > seen_h[h]:
+                seen_h[h] = sz
         if has_aud:
             for h in sorted(seen_h, reverse=True):
                 sz = seen_h[h] + aud_sz if seen_h[h] else 0
                 merged.append({"type": "ytmerge", "url": url, "ext": "mp4", "headers": {},
                                "height": h,
                                "label": MSG["ytdlp_ready"] % ("%dp" % h, "mp4", human_size(sz) if sz else MSG["size_unknown"])})
+            dur = int(info.get("duration") or 0)
+            for kbps in (320, 160, 128, 70):
+                est = int(dur * kbps * 1000 / 8) if dur else 0
+                merged.append({"type": "ytmp3", "url": url, "ext": "mp3", "headers": {},
+                               "bitrate": kbps,
+                               "label": MSG["ytdlp_mp3"] % ("%dK" % kbps, human_size(est) if est else MSG["size_unknown"])})
     options.extend(merged)
 
     progressive = [f for f in fmts if f.get("url")
@@ -1617,7 +1634,8 @@ def _eng_options(eng_options):
         out.append(dict(group=group, quality=lab, ext=ext, size=None,
                         type=o.get("type") or "file", url=o["url"],
                         headers=o.get("headers") or {}, note=note,
-                        **({"height": o["height"]} if o.get("height") else {})))
+                        **({"height": o["height"]} if o.get("height") else {}),
+                        **({"bitrate": o["bitrate"]} if o.get("bitrate") else {})))
     return out
 
 
@@ -1784,6 +1802,10 @@ def _run_job(job, opt, title):
             path, size = yt_chain.download_merged(opt["url"], dest, opt["height"],
                                                   on_progress=prog, cancel=cancel,
                                                   base_opts=_ytdlp_base_opts())
+        elif opt["type"] == "ytmp3":
+            path, size = yt_chain.download_mp3(opt["url"], dest, opt["bitrate"],
+                                               on_progress=prog, cancel=cancel,
+                                               base_opts=_ytdlp_base_opts())
         elif opt["type"] == "tiktok":
             err = None
             path = None
