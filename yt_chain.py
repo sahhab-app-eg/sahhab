@@ -89,7 +89,19 @@ def install():
                 headers["Authorization"] = "Bearer " + token
             headers["User-Agent"] = PS4_UA
             kwargs["headers"] = headers
-            resp = orig(self, ep, *args, **kwargs)
+            try:
+                resp = orig(self, ep, *args, **kwargs)
+            except Exception as e:  # noqa: BLE001
+                detail = ""
+                code = getattr(e, "code", None)
+                if code:
+                    try:
+                        detail = (e.read() or b"")[:120].decode("utf-8", "replace")
+                    except Exception:  # noqa: BLE001
+                        detail = ""
+                _log("player call RAISED: %s code=%s body=%s" % (
+                    type(e).__name__, code, detail))
+                raise
             try:
                 ps = (resp or {}).get("playabilityStatus") or {}
                 _log("player response: status=%s reason=%s" % (
