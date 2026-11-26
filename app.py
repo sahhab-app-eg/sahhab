@@ -189,7 +189,12 @@ MSG = {
     "ytdlp_video_only": "🎞️ %s (%s) - فيديو لوحده",
     "ytdlp_audio": "🎧 صوت بس %s (%s)",
     "ytdlp_mp3": "🎵 MP3 %s (%s)",
+    "heavy_busy": "فيه تحميل تقيل شغال دلوقتي.. استنى لما يخلص وجرب تاني ⏳",
 }
+
+# تحميلات الدمج (yt-dlp + ffmpeg) بتستهلك رام كتير على الاستضافة الصغيرة،
+# فمسموح بواحدة بس في نفس الوقت.
+HEAVY_TYPES = ("ytmerge", "ytmp3")
 
 UA_PHONE = ("Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36")
@@ -1843,12 +1848,19 @@ def start_job(token, opt_id):
         opt = info["options"][int(opt_id)]
     except (ValueError, IndexError):
         raise SahhabError("الاختيار ده مش موجود")
+    heavy = opt["type"] in HEAVY_TYPES
+    if heavy:
+        with JOBS_LOCK:
+            busy = any(j.get("_heavy") and j["state"] in ("queued", "running")
+                       for j in JOBS.values())
+        if busy:
+            raise SahhabError(MSG["heavy_busy"])
     jid = uuid.uuid4().hex[:10]
     job = {
         "id": jid, "state": "queued", "title": info["meta"]["title"], "thumb": info["meta"].get("thumb", ""),
         "quality": opt["quality"], "ext": opt["ext"], "pct": 0, "done": 0, "total": None,
         "speed": "", "eta": "", "file": "", "path": "", "error": "", "size": "", "segments": False,
-        "ts": time.time(), "_cancel": threading.Event()
+        "ts": time.time(), "_cancel": threading.Event(), "_heavy": heavy,
     }
     with JOBS_LOCK:
         JOBS[jid] = job
