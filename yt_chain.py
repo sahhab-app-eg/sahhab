@@ -112,8 +112,49 @@ def install():
         return orig(self, ep, *args, **kwargs)
 
     _base.YoutubeBaseInfoExtractor._call_api = patched
+    install_url_proxy()
     _installed = True
     _log("monkeypatch installed (tv client, PS4 UA, Bearer on player calls)")
+
+
+_PROXY_HOSTS = ("googlevideo.com", "youtube.com", "youtubei.googleapis.com")
+
+
+def _proxy_target(url):
+    import urllib.parse as _up
+    h = _up.urlparse(url).hostname or ""
+    if any(h == p or h.endswith("." + p) for p in _PROXY_HOSTS):
+        base = os.environ.get("YT_PROXY_URL", "").rstrip("/")
+        if base:
+            return base + "/?u=" + _up.quote(url, safe="")
+    return None
+
+
+def install_url_proxy():
+    """Route all YouTube/googlevideo traffic through the YT_PROXY_URL reverse proxy.
+
+    The proxy (a Cloudflare Worker) supplies clean egress IPs; the request keeps
+    its headers/body verbatim, plus the X-Sahhab-Key shared-key header.
+    """
+    key = os.environ.get("YT_PROXY_KEY", "")
+    if not (os.environ.get("YT_PROXY_URL") and key):
+        return
+    from yt_dlp import YoutubeDL
+    from yt_dlp.networking import Request
+
+    orig = YoutubeDL.urlopen
+
+    def patched(self, req):
+        nu = _proxy_target(req.url)
+        if nu:
+            headers = dict(req.headers)
+            headers["X-Sahhab-Key"] = key
+            req = Request(nu, data=req.data, headers=headers,
+                          method=getattr(req, "method", None))
+        return orig(self, req)
+
+    YoutubeDL.urlopen = patched
+    _log("url proxy active (YT_PROXY_URL)")
 
 
 def chain_opts():
@@ -122,7 +163,7 @@ def chain_opts():
     install()
     return {
         "extractor_args": {
-            "youtube": {"player_client": ["tv"]},
+            "youtube": {"player_client": ["tv"], "player_skip": ["webpage", "configs"]},
             "youtubepot-bgutilhttp": {"base_url": ["http://127.0.0.1:4416"]},
             # dev mode: our vendored solver build (upstream 0.8.0 + PR #80)
             # intentionally differs from the pinned release hash.
